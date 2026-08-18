@@ -1,0 +1,6 @@
+# Temporary --patch overlay for boot verification: mounts the one-shot
+# search probe into the booted composition (dev artifact, not part of the
+# plugin's own patch).
+- insert:
+    - id: search-probe
+      name: /Users/xgrin/Desktop/dsh-plugin/dsh-search-router/test/probe.mjs

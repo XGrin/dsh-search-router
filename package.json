@@ -1,0 +1,30 @@
+{
+  "name": "dsh-search-router",
+  "version": "0.1.0",
+  "description": "Route DSH's native web_search tool to user-configured search providers (Exa, Tavily, Brave, SearXNG) with sequential fallback. The plugin is a router, not a search engine.",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "web-search",
+    "search-router",
+    "exa",
+    "tavily",
+    "brave",
+    "searxng",
+    "cordis"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
