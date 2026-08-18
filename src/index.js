@@ -6,14 +6,23 @@
  * web capability seam (`ctx.web`); the model keeps seeing the same native
  * `web_search` tool, and the composition patch beside this package points
  * `web.searchProvider` at the router. Search backends (Exa, Tavily, Brave,
- * SearXNG) are plain HTTP adapters over the global `fetch` — the plugin has
- * zero runtime dependencies and adds no tools, no MCP servers, and no
- * provider-specific fields to the model surface.
+ * SearXNG) are plain HTTP adapters over the global `fetch` — the plugin adds
+ * no tools, no MCP servers, and no provider-specific fields to the model
+ * surface.
+ *
+ * Configuration has two layers over one router: the plugin row config in the
+ * profile's composition (cordis.patch.yml — the full nested shape), and the
+ * flat `search-router` settings section the Plugins settings page edits
+ * (this package's browser half ships the card; API keys go through the
+ * credentials domain, never into the settings document). The provider
+ * re-resolves the merged config at every search, so either layer's changes
+ * are live without a restart.
  *
  * This plugin does not provide a search engine. It routes DSH's native
  * web_search capability to user-configured search providers.
  */
 import { parseConfig, createRouterProvider } from "./router.js";
+import { SETTINGS_NS, SettingsConfig, projectBase, mergeRuntime, validateSection } from "./settings.js";
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = "search-router";
@@ -22,13 +31,27 @@ export const name = "search-router";
 export const inject = ["web"];
 
 /**
- * Register the router provider. Config validation happens here so a bad
- * composition fails loudly at load instead of silently at search time.
+ * Register the router provider and, when the settings service is available,
+ * serve the `search-router` settings section over it. The inner inject keeps
+ * settings optional: a composition without the settings service still gets a
+ * working router driven purely by its row config.
  *
  * @param {object} ctx - the plugin context (`web` is injected).
  * @param {unknown} config - the search-router row config (see parseConfig).
  */
 export function apply(ctx, config) {
-  const parsed = parseConfig(config);
-  ctx.web.registerSearchProvider(createRouterProvider(ctx, parsed));
+  const composition = parseConfig(config);
+  const base = projectBase(composition);
+  let section;
+  ctx.inject(["settings"], (sctx) => {
+    const scope = sctx.settings.register(SETTINGS_NS, SettingsConfig, {
+      base,
+      validate: validateSection,
+    });
+    section = () => scope.get();
+    sctx.effect(() => () => {
+      section = undefined;
+    }, "search-router: settings section");
+  });
+  ctx.web.registerSearchProvider(createRouterProvider(ctx, () => mergeRuntime(composition, section?.(), base)));
 }

@@ -1,11 +1,21 @@
 {
   "name": "dsh-search-router",
-  "version": "0.1.0",
-  "description": "Route DSH's native web_search tool to user-configured search providers (Exa, Tavily, Brave, SearXNG) with sequential fallback. The plugin is a router, not a search engine.",
+  "version": "0.2.0",
+  "description": "Route DSH's native web_search tool to user-configurable search providers (Exa, Tavily, Brave, SearXNG) with sequential fallback. The plugin is a router, not a search engine.",
   "type": "module",
   "main": "src/index.js",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./client": {
+      "default": "./client/client.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "src",
+    "client",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -25,6 +35,19 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
     }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
   }
 }

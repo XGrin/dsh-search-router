@@ -160,11 +160,16 @@ function normalizeOptionalURL(value, field) {
  * `apiKeyEnv` doubles as the credential reference, exactly like the shipped
  * web-search-deepseek provider.
  *
+ * The provider resolves its config through `resolveConfig()` at every search
+ * (and every `available()` call), so settings writes from the Plugins page
+ * take effect on the next search with no restart.
+ *
  * @param {object} ctx - the plugin context (`web` is injected).
- * @param {object} config - the normalized plugin config.
+ * @param {() => object} resolveConfig - returns the currently effective
+ *   normalized config (composition merged with the settings section).
  * @returns {object} the `search-router` WebSearchProvider.
  */
-export function createRouterProvider(ctx, config) {
+export function createRouterProvider(ctx, resolveConfig) {
   const log = typeof ctx.logger === "function" ? ctx.logger("dsh-search-router") : ctx.logger;
 
   /** Resolve one variable through the launch snapshot, then process.env. */
@@ -189,6 +194,7 @@ export function createRouterProvider(ctx, config) {
 
   /** The backend chain per the CURRENT config (cheap, sync, no network). */
   const chain = () => {
+    const config = resolveConfig();
     if (config.order !== undefined) return config.order;
     if (config.provider !== undefined) return [config.provider];
     return ids().filter((id) => locallyConfigured(id));
@@ -201,7 +207,7 @@ export function createRouterProvider(ctx, config) {
    * not auto-detected — set `provider`/`order` explicitly for those.
    */
   const locallyConfigured = (id) => {
-    const section = config.providers[id] ?? {};
+    const section = resolveConfig().providers[id] ?? {};
     if (BACKENDS[id].defaultApiKeyEnv === undefined) {
       return (section.baseURL ?? ambient(section.baseUrlEnv ?? "SEARXNG_BASE_URL")) !== undefined;
     }
@@ -210,7 +216,7 @@ export function createRouterProvider(ctx, config) {
 
   /** Resolve everything one backend needs right before calling it. */
   const arm = async (id) => {
-    const section = config.providers[id] ?? {};
+    const section = resolveConfig().providers[id] ?? {};
     const backend = BACKENDS[id];
     const keyed = backend.defaultApiKeyEnv !== undefined;
     const apiKey = keyed ? section.apiKey ?? await resolveSecret(section.apiKeyEnv ?? backend.defaultApiKeyEnv) : undefined;
@@ -243,8 +249,8 @@ export function createRouterProvider(ctx, config) {
         const armed = await arm(id);
         if ((backend.defaultApiKeyEnv !== undefined && armed.apiKey === undefined) || armed.baseURL === undefined) {
           const hint = backend.defaultApiKeyEnv === undefined
-            ? `missing endpoint (set providers.searxng.baseUrl or export ${section0(config, id).baseUrlEnv ?? "SEARXNG_BASE_URL"})`
-            : `missing API key (set providers.${id}.apiKey, or export ${section0(config, id).apiKeyEnv ?? backend.defaultApiKeyEnv})`;
+            ? `missing endpoint (set providers.searxng.baseUrl, the Plugins settings page, or export ${section0(resolveConfig(), id).baseUrlEnv ?? "SEARXNG_BASE_URL"})`
+            : `missing API key (set providers.${id}.apiKey, the Plugins settings page, or export ${section0(resolveConfig(), id).apiKeyEnv ?? backend.defaultApiKeyEnv})`;
           failures.push(`${id}: ${hint}`);
           log?.info?.(`${id}: ${hint} — skipped${next(id, ids_)}`);
           continue;
@@ -254,9 +260,9 @@ export function createRouterProvider(ctx, config) {
           const result = await backend.search(
             { query: request.query, maxResults: request.maxResults ?? DEFAULT_MAX_RESULTS },
             armed,
-            { signal, timeoutMs: config.timeoutMs },
+            { signal, timeoutMs: resolveConfig().timeoutMs },
           );
-          if (result.sources.length === 0 && config.emptyResultsFallback) {
+          if (result.sources.length === 0 && resolveConfig().emptyResultsFallback) {
             failures.push(`${id}: 0 results`);
             emptiest = result;
             log?.info?.(`${id}: 0 results${next(id, ids_)}`);

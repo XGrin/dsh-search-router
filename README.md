@@ -57,12 +57,29 @@ dsh plugin --profile web remove dsh-search-router
 
 ## Configure
 
-Configuration lives in the profile's own patch layer —
-`$DSH_HOME/profiles/web/cordis.patch.yml` (create it if absent; it applies
-after every bundle layer). A patch **replaces** the row's whole `config`, so
-state the complete block each time. With zero configuration the router
-auto-detects any provider whose key/endpoint is ambient (see below) and tries
-them in canonical order: exa → tavily → brave → searxng.
+There are two ways, targeting the same knobs:
+
+- **In the app** (recommended): **Settings → Plugins → Plugin configuration**
+  shows a "Search router" card styled like the Models page — one row card per
+  active provider, **numbered by fallback priority and draggable to
+  reorder**, with credential-state dots, an inline editor per provider (API
+  key / SearXNG endpoint), a dashed **add-provider** flow for the rest, and
+  an Advanced fold (timeout, empty-results policy). Every structural change
+  commits immediately and applies **live**, no restart; with no explicit
+  order stored the card shows the auto-detected chain. API keys set here are
+  persisted in the settings document (`role: secret` — redacted on every
+  wire crossing) and **override** the environment variable; unset the key to
+  fall back to `EXA_API_KEY` / `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY`.
+- **In the composition**: the profile's own patch layer —
+  `$DSH_HOME/profiles/web/cordis.patch.yml` (create it if absent; it applies
+  after every bundle layer). A patch **replaces** the row's whole `config`,
+  so state the complete block each time.
+
+The two layers compose field-by-field with the GUI layer winning per field;
+unsetting a field in the GUI (Reset to default) re-inherits the composition
+value. With zero configuration the router auto-detects any provider whose
+key/endpoint is ambient (see below) and tries them in canonical order:
+exa → tavily → brave → searxng.
 
 ### Exa (single provider)
 
@@ -170,35 +187,41 @@ and watch the log lines:
 
 ## Scope (and non-scope)
 
-v0.1.0 is deliberately minimal: four adapters, one router, one composition
-patch. Not included on purpose — reranking, RRF, merging, caching, history,
-stats, fetch routing (`web_fetch` stays with DSH), query rewriting, custom
-HTTP providers, parallel search. The `Backend` contract in `src/router.js` is
-the seam where a new provider would slot in.
+v0.2.0 is deliberately minimal: four adapters, one router, one settings card,
+one composition patch. Not included on purpose — reranking, RRF, merging,
+caching, history, stats, fetch routing (`web_fetch` stays with DSH), query
+rewriting, custom HTTP providers, parallel search. The `Backend` contract in
+`src/router.js` is the seam where a new provider would slot in.
 
 ## Files
 
 ```
 dsh-search-router/
-├── package.json          # dsh.bundle.patch declaration
+├── package.json          # dsh.bundle.patch + dsh.client declarations
 ├── cordis.patch.yml      # composition: insert row, aim the seam, disable deepseek search
 ├── README.md
-└── src/
-    ├── index.js          # cordis plugin glue (name/inject/apply)
-    ├── router.js         # chain selection, arming, fallback, aggregation
-    ├── lib.js            # fetch+timeout+normalization helpers
-    └── providers/        # exa.js, tavily.js, brave.js, searxng.js
+├── src/
+│   ├── index.js          # cordis plugin glue (name/inject/apply)
+│   ├── router.js         # chain selection, arming, fallback, aggregation
+│   ├── settings.js       # settings schema + composition/settings merge
+│   ├── lib.js            # fetch+timeout+normalization helpers
+│   └── providers/        # exa.js, tavily.js, brave.js, searxng.js
+└── client/
+    └── client.js         # browser half: the Settings → Plugins card
 ```
 
 ## Development
 
 `test/integration.mjs` exercises the router against the **real**
-`@deepseek-ai/dsh-web` seam with local mock provider endpoints (429, timeout,
-success, empty) — no network, no keys:
+`@deepseek-ai/dsh-web` and `@deepseek-ai/dsh-settings-file` packages with
+local mock provider endpoints (429, timeout, success, empty, settings
+re-routing, merge semantics) — no network, no keys:
 
 ```bash
 node test/integration.mjs /path/to/a/dsh/installation/node_modules
 ```
 
 The directory must contain `@deepseek-ai/dsh-web` (any DSH install, e.g. an
-npx cache or the profile's healed `node_modules`).
+npx cache or the profile's healed `node_modules`). `test/client-smoke.mjs`
+loads the browser bundle the way the web shell does and drives the card
+controller through edit/save against stub scopes: `node test/client-smoke.mjs`.

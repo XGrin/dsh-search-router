@@ -14,15 +14,18 @@
 import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { resolve } from "node:path";
-import { availableParallelism } from "node:os";
+import { join, resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 /* ------------------------------------------------------------------ setup */
 
 const modulesDir = resolve(process.argv[2] ?? process.env.DSH_MODULES ?? ".");
 const { Context } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/cordis/lib/index.js")).href);
 const { default: WebRuntime } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-web/lib/index.js")).href);
+const { default: FileSettingsProvider } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-settings-file/lib/index.js")).href);
 const routerPlugin = await import(pathToFileURL(resolve("src/index.js")).href);
+const settingsExports = await import(pathToFileURL(resolve("src/settings.js")).href);
 
 /** Mutable mock-endpoint behavior; each case adjusts what it needs. */
 const behavior = {
@@ -67,7 +70,7 @@ const server = createServer((request, response) => {
       return; /* never respond: the caller times out */
     }
     if (request.url?.startsWith("/exa/")) {
-      seen.exa.push({ url: request.url, body: chunks });
+      seen.exa.push({ url: request.url, body: chunks, key: request.headers["x-api-key"] });
       return send(behavior.exa);
     }
     if (request.url?.startsWith("/tavily/")) {
@@ -101,11 +104,20 @@ function check(label, condition, detail) {
   }
 }
 function eq(label, actual, expected) {
-  check(label, JSON.stringify(actual) === JSON.stringify(expected), { actual, expected });
+  const canon = (value) => JSON.stringify(sortDeep(value));
+  check(label, canon(actual) === canon(expected), { actual, expected });
+}
+/** Key-order-insensitive canonical form for JSON-shaped values. */
+function sortDeep(value) {
+  if (Array.isArray(value)) return value.map(sortDeep);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortDeep(value[key])]));
+  }
+  return value;
 }
 
 /** Boot one fresh app: the real seam configured for search-router + our plugin. */
-async function boot(config, env = {}) {
+async function boot(config, env = {}, options = {}) {
   const saved = {};
   for (const [name, value] of Object.entries(env)) {
     saved[name] = process.env[name];
@@ -119,9 +131,17 @@ async function boot(config, env = {}) {
     }
   };
   const ctx = new Context();
+  if (options.settingsPath !== undefined) ctx.plugin(FileSettingsProvider, { path: options.settingsPath, watch: false });
   ctx.plugin(WebRuntime, { searchProvider: "search-router" });
   const fiber = ctx.plugin(routerPlugin, config);
   await fiber;
+  if (options.settingsPath !== undefined) {
+    const started = Date.now();
+    while (Date.now() - started < 2000) {
+      if (ctx.settings.describe().some((view) => view.ns === "search-router")) break;
+      await sleep(25);
+    }
+  }
   return { ctx, restore };
 }
 
@@ -341,6 +361,180 @@ console.log("case 10: bad config fails loudly at load");
     error = thrown;
   }
   check("provider XOR order enforced", /not both/.test(String(error)), String(error));
+}
+
+console.log("case 11: settings section is served for the Plugins page");
+{
+  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
+  const settingsPath = join(dir, "settings.yaml");
+  try {
+    const { ctx, restore } = await boot({
+      provider: "exa",
+      timeoutMs: 2000,
+      providers: providersBase(),
+    }, {}, { settingsPath });
+    const views = ctx.settings.describe();
+    const view = views.find((candidate) => candidate.ns === "search-router");
+    check("namespace registered", view !== undefined, views.map((v) => v.ns));
+    check("applies live", view?.applies === "live", view?.applies);
+    eq("base projects the composition", view?.base, {
+      provider: "exa", order: "", timeoutMs: 2000, emptyResultsFallback: true,
+      exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
+      searxngBaseUrl: `${base}/searxng`, searxngBaseUrlEnv: "",
+    });
+    eq("resolved section carries schema defaults over base", view?.value, {
+      provider: "exa", order: "", timeoutMs: 2000, emptyResultsFallback: true,
+      exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
+      searxngBaseUrl: `${base}/searxng`, searxngBaseUrlEnv: "",
+    });
+    await ctx.dispose?.();
+    restore();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("case 12: settings writes re-route live searches (the GUI path)");
+{
+  resetBehavior();
+  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
+  const settingsPath = join(dir, "settings.yaml");
+  try {
+    const { ctx, restore } = await boot({
+      provider: "exa",
+      timeoutMs: 2000,
+      providers: providersBase(),
+    }, {}, { settingsPath });
+    const before = await ctx.web.search({ query: "via composition", maxResults: 5 });
+    eq("composition routing first", before.sources.map((s) => s.url), ["https://example.com/1", "https://example.com/2"]);
+    await ctx.settings.mutate("search-router", [{ op: "set", path: ["provider"], value: "searxng" }]);
+    const after = await ctx.web.search({ query: "via settings", maxResults: 5 });
+    eq("settings write re-routes to searxng", after.sources.map((s) => s.url), ["https://example.com/s1"]);
+    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["provider"] }]);
+    const reverted = await ctx.web.search({ query: "back to composition", maxResults: 5 });
+    eq("unset reverts to the composition layer", reverted.sources.map((s) => s.url), ["https://example.com/1", "https://example.com/2"]);
+    await ctx.dispose?.();
+    restore();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("case 13: settings validation refuses contradictory writes");
+{
+  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
+  const settingsPath = join(dir, "settings.yaml");
+  try {
+    const { ctx, restore } = await boot({ timeoutMs: 2000 }, {}, { settingsPath });
+    let error;
+    try {
+      await ctx.settings.mutate("search-router", [
+        { op: "set", path: ["provider"], value: "exa" },
+        { op: "set", path: ["order"], value: "exa, searxng" },
+      ]);
+    } catch (thrown) {
+      error = thrown;
+    }
+    check("provider XOR order refused", /not both/.test(String(error)), String(error));
+    error = undefined;
+    try {
+      await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: "google, exa" }]);
+    } catch (thrown) {
+      error = thrown;
+    }
+    check("unknown id in order refused", /unknown provider "google"/.test(String(error)), String(error));
+    const views = ctx.settings.describe();
+    const view = views.find((candidate) => candidate.ns === "search-router");
+    eq("refused writes stored nothing", view?.user, void 0);
+    await ctx.dispose?.();
+    restore();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("case 14: settings fallback order and merge semantics");
+{
+  resetBehavior();
+  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
+  const settingsPath = join(dir, "settings.yaml");
+  try {
+    behavior.exa = { status: 429, body: {} };
+    const { ctx, restore } = await boot({ timeoutMs: 2000, providers: providersBase() }, {}, { settingsPath });
+    await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: "exa, searxng" }]);
+    const result = await ctx.web.search({ query: "chain via settings", maxResults: 5 });
+    eq("order string drives the fallback chain", result.sources.map((s) => s.url), ["https://example.com/s1"]);
+    await ctx.settings.mutate("search-router", [{ op: "set", path: ["searxngBaseUrl"], value: `${base}/nothing` }]);
+    let error;
+    try {
+      await ctx.web.search({ query: "endpoint moved", maxResults: 5 });
+    } catch (thrown) {
+      error = thrown;
+    }
+    check("searxngBaseUrl override applies", /searxng: HTTP 404/.test(String(error)), String(error));
+    await ctx.dispose?.();
+    restore();
+    behavior.exa = structuredClone(defaults.exa);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("case 16: a key stored in settings overrides the ambient environment");
+{
+  resetBehavior();
+  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
+  const settingsPath = join(dir, "settings.yaml");
+  try {
+    const { ctx, restore } = await boot({
+      timeoutMs: 2000,
+      providers: { exa: { baseURL: `${base}/exa` }, tavily: {}, brave: {}, searxng: {} },
+    }, { EXA_API_KEY: "ambient-env-key" }, { settingsPath });
+    const first = await ctx.web.search({ query: "ambient key", maxResults: 5 });
+    check("ambient env key reaches the provider", first.sources.length === 2 && seen.exa.at(-1)?.key === "ambient-env-key", seen.exa.at(-1));
+    await ctx.settings.mutate("search-router", [{ op: "set", path: ["exaApiKey"], value: "settings-stored-key" }]);
+    const second = await ctx.web.search({ query: "stored key", maxResults: 5 });
+    check("settings-stored key overrides the environment", second.sources.length === 2 && seen.exa.at(-1)?.key === "settings-stored-key", seen.exa.at(-1));
+    const redacted = ctx.settings.describe({ redactSecrets: true }).find((view) => view.ns === "search-router");
+    check("redacted view hides the stored key", !JSON.stringify(redacted?.value ?? {}).includes("settings-stored-key"), redacted?.value);
+    check("secret sidecar reports the slot as set", redacted?.secrets?.some((secret) => secret.path?.[0] === "exaApiKey" && secret.set === true), redacted?.secrets);
+    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["exaApiKey"] }]);
+    const third = await ctx.web.search({ query: "back to ambient", maxResults: 5 });
+    check("unsetting falls back to the environment", third.sources.length === 2 && seen.exa.at(-1)?.key === "ambient-env-key", seen.exa.at(-1));
+    let error;
+    try {
+      await ctx.settings.mutate("search-router", [{ op: "set", path: ["exaApiKey"], value: "  " }]);
+    } catch (thrown) {
+      error = thrown;
+    }
+    check("blank key refused", /non-empty/.test(String(error)), String(error));
+    await ctx.dispose?.();
+    restore();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("case 15: mergeRuntime layering as a pure function");
+{
+  const composition = settingsExports.projectBase;
+  const base = composition({ provider: "exa", order: undefined, timeoutMs: 5000, emptyResultsFallback: true, providers: {} });
+  const merge = (resolved) => settingsExports.mergeRuntime({ provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {} }, resolved, base);
+  eq("identical resolution inherits the composition", merge(structuredClone(base)), {
+    provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
+  });
+  eq("changed timeoutMs overrides only that field", merge({ ...structuredClone(base), timeoutMs: 1500 }), {
+    provider: "exa", timeoutMs: 1500, emptyResultsFallback: true, providers: {},
+  });
+  eq("order set clears a composition provider", merge({ ...structuredClone(base), order: "searxng" }), {
+    order: ["searxng"], timeoutMs: 5000, emptyResultsFallback: true, providers: {},
+  });
+  eq("explicit Automatic clears composition routing", merge({ ...structuredClone(base), provider: "" }), {
+    timeoutMs: 5000, emptyResultsFallback: true, providers: {},
+  });
+  eq("undefined section is the composition itself", merge(void 0), {
+    provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
+  });
 }
 
 /* ------------------------------------------------------------------- done */
