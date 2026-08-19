@@ -7,7 +7,7 @@
  * `snippet`) and sometimes `published_date`. The API can also synthesize an
  * answer (`include_answer`) — deliberately not requested in the MVP.
  */
-import { httpJSON, normalizeSources, clampCount } from "../lib.js";
+import { httpJSON, normalizeSources, clampCount, joinURL } from "../lib.js";
 
 /** The Tavily backend descriptor (see src/router.js for the backend contract). */
 export const tavily = {
@@ -21,7 +21,7 @@ export const tavily = {
       max_results: clampCount(request.maxResults, 8, 20),
       search_depth: "basic",
     };
-    const json = await httpJSON(`${armed.baseURL}/search`, {
+    const json = await httpJSON(joinURL(armed.baseURL, "search").href, {
       method: "POST",
       headers: {
         authorization: `Bearer ${armed.apiKey}`,

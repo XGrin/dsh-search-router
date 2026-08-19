@@ -85,7 +85,26 @@ export function validateSection(section) {
   if (section.provider !== "" && section.order.trim() !== "") {
     throw new Error('search-router: set either "provider" (single) or "order" (fallback chain), not both');
   }
-  if (section.order.trim() !== "") parseOrderString(section.order);
+  if (section.order.trim() !== "") {
+    // ", ," parses to zero providers; an order that names nothing would
+    // silently empty the chain, so refuse it at the same layer the
+    // composition's parseConfig refuses an empty array.
+    if (parseOrderString(section.order).length === 0) {
+      throw new Error(`search-router: "order" names no providers (expected ${BACKEND_IDS.join(", ")})`);
+    }
+  }
+  const searxngUrl = String(section.searxngBaseUrl ?? "").trim();
+  if (searxngUrl !== "") {
+    let parsed;
+    try {
+      parsed = new URL(searxngUrl);
+    } catch {
+      throw new Error("search-router: searxngBaseUrl must be a valid http(s) URL");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("search-router: searxngBaseUrl must be an http(s) URL");
+    }
+  }
   for (const field of ["exaApiKey", "tavilyApiKey", "braveApiKey"]) {
     if (section[field] !== undefined && String(section[field]).trim() === "") {
       throw new Error(`search-router: ${field} must be non-empty when set (unset it to fall back to the environment)`);

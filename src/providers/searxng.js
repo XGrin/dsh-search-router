@@ -10,7 +10,7 @@
  * `title` / `content` (mapped to `snippet`) and sometimes `publishedDate`.
  * SearXNG has no count parameter, so the shared normalizer truncates.
  */
-import { httpJSON, normalizeSources, joinURL } from "../lib.js";
+import { httpJSON, normalizeSources, joinURL, USER_AGENT } from "../lib.js";
 
 /** The SearXNG backend descriptor (see src/router.js for the backend contract). */
 export const searxng = {
@@ -26,7 +26,7 @@ export const searxng = {
       method: "GET",
       headers: {
         accept: "application/json",
-        "user-agent": "dsh-search-router/0.1.0",
+        "user-agent": USER_AGENT,
       },
     }, options);
     return normalizeSources(json?.results, request.maxResults);

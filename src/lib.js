@@ -3,12 +3,20 @@
  * per-provider timeout, caller-cancellation propagation, and the mapping of
  * arbitrary provider result items onto the DSH `WebSearchSource` shape.
  *
- * Everything here uses the platform `fetch` and `AbortController` only —
- * the plugin ships zero runtime dependencies by design.
+ * Everything here uses the platform `fetch` and `AbortController` only; the
+ * plugin's single runtime dependency (`@deepseek-ai/schemastery`) belongs to
+ * the settings module, not this transport layer.
  */
+
+import { readFileSync } from "node:fs";
 
 /** Default per-provider timeout (ms). Overridable via the plugin config. */
 export const DEFAULT_TIMEOUT_MS = 10000;
+
+/** Attribution header sent to search providers; version from package.json. */
+export const USER_AGENT = `dsh-search-router/${
+  JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version
+}`;
 
 /** Hard cap on one source's snippet; long provider content is trimmed, never invented. */
 const MAX_SNIPPET_CHARS = 400;
@@ -141,7 +149,7 @@ export function toSource(item) {
   const title = nonEmpty(item.title);
   if (title !== undefined) source.title = title;
   const snippet = nonEmpty(item.snippet) ?? nonEmpty(item.text) ?? nonEmpty(item.content) ?? nonEmpty(item.description);
-  if (snippet !== undefined) source.snippet = truncate(snippet, MAX_SNIPPET_CHARS);
+  if (snippet !== undefined) source.snippet = truncate(stripTags(snippet), MAX_SNIPPET_CHARS);
   const publishedAt = dateField(item.publishedAt ?? item.publishedDate ?? item.published_date ?? item.page_age ?? item.age);
   if (publishedAt !== undefined) source.publishedAt = publishedAt;
   return source;
@@ -157,6 +165,18 @@ function dateField(value) {
 /** Trim to a cap with an ellipsis marker; never lengthens. */
 function truncate(text, cap) {
   return text.length > cap ? `${text.slice(0, cap)}…` : text;
+}
+
+/**
+ * Drop HTML markup from a provider snippet (Brave bold-marks the query with
+ * `<b>` tags; other providers occasionally ship anchors). Snippets are plain
+ * text on the model surface, so markup is noise, not information.
+ *
+ * @param {string} text - the raw provider snippet.
+ * @returns {string} the snippet without any tags.
+ */
+function stripTags(text) {
+  return text.replace(/<\/?[a-z][^>]*>/giu, "");
 }
 
 /**
@@ -205,8 +225,4 @@ export function clampCount(maxResults, fallback, max) {
   return Math.min(count, max);
 }
 
-/** Parse a `baseURL`-ish config value and strip a trailing slash. */
-export function normalizeBaseURL(value) {
-  const text = nonEmpty(value);
-  return text === undefined ? undefined : text.replace(/\/+$/u, "");
-}
+

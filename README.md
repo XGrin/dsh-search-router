@@ -1,16 +1,12 @@
 # dsh-search-router
 
-> dsh-search-router does not provide a search engine. It routes DSH's native
-> `web_search` capability to user-configured search providers.
+**English** · [中文](README.zh.md)
 
 A tiny [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness)
-plugin: one native `WebSearchProvider` (id `search-router`) registered into
-`ctx.web`, forwarding every `web_search` call to a search backend **you** choose
-— with sequential fallback when one fails.
-
-The model keeps seeing the same native `web_search` tool. No new tools, no MCP
-server, no reranking, no caching — just a router. Zero runtime dependencies
-(global `fetch` only).
+plugin: one native `WebSearchProvider` registered into `ctx.web`, forwarding
+every `web_search` call to a search backend you choose — with sequential
+fallback when one fails. The model keeps seeing the same `web_search` tool; no
+new tools, no MCP, no reranking, no caching.
 
 ```
 DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Brave / SearXNG
@@ -20,145 +16,96 @@ DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Br
 
 | Provider | Credential | Endpoint |
 | --- | --- | --- |
-| **Exa** | `EXA_API_KEY` | `https://api.exa.ai` (override: `providers.exa.baseURL`) |
-| **Tavily** | `TAVILY_API_KEY` | `https://api.tavily.com` (override: `providers.tavily.baseURL`) |
-| **Brave** | `BRAVE_SEARCH_API_KEY` | `https://api.search.brave.com` (override: `providers.brave.baseURL`) |
-| **SearXNG** | — none, self-hosted | `SEARXNG_BASE_URL` or `providers.searxng.baseUrl` |
+| **Exa** | `EXA_API_KEY` | `https://api.exa.ai` |
+| **Tavily** | `TAVILY_API_KEY` | `https://api.tavily.com` |
+| **Brave** | `BRAVE_SEARCH_API_KEY` | `https://api.search.brave.com` |
+| **SearXNG** | none (self-hosted) | `SEARXNG_BASE_URL` |
 
-SearXNG keeps the router fully self-hostable: with your own instance you need
-no commercial search API at all. The instance must enable the `json` output
-format (`search.formats` in its `settings.yml`).
+SearXNG keeps the router fully self-hostable — no commercial API needed. The
+instance must enable the `json` output format (`search.formats` in its
+`settings.yml`). Endpoints of the three commercial providers can be overridden
+per provider (see the full schema below).
 
 ## Install
 
 ```bash
-# from a local checkout
-dsh plugin --profile web add link:/path/to/dsh-search-router
-
-# or, once published
-dsh plugin --profile web add dsh-search-router
-
+dsh plugin --profile web add link:/path/to/dsh-search-router   # local checkout
+dsh plugin --profile web add dsh-search-router                 # or, once published
 dsh web
 ```
 
-The plugin's composition patch (`cordis.patch.yml`) does three things:
-
-1. inserts the `search-router` plugin row;
-2. sets `web.searchProvider: search-router` so the seam resolves to the router;
-3. disables the built-in `web-search-deepseek` row and re-enables the
-   model-facing `web_search` tool (`tool-web`, which the shipped web profile
-   keeps off).
-
-Uninstall restores the original composition:
-
-```bash
-dsh plugin --profile web remove dsh-search-router
-```
+The composition patch points the web seam at the router, disables the built-in
+DeepSeek search provider, and re-enables the `web_search` tool in the web
+profile. Uninstall (`dsh plugin --profile web remove dsh-search-router`)
+restores the original composition.
 
 ## Configure
 
-There are two ways, targeting the same knobs:
+Two ways, targeting the same knobs — the GUI wins per field, and a GUI reset
+re-inherits the composition value. With zero configuration the router
+auto-detects every provider whose key or endpoint is ambient, in canonical
+order: exa → tavily → brave → searxng.
 
-- **In the app** (recommended): **Settings → Plugins → Plugin configuration**
-  shows a "Search router" card styled like the Models page — one row card per
-  active provider, **numbered by fallback priority and draggable to
-  reorder**, with credential-state dots, an inline editor per provider (API
-  key / SearXNG endpoint), a dashed **add-provider** flow for the rest, and
-  an Advanced fold (timeout, empty-results policy). Every structural change
-  commits immediately and applies **live**, no restart; with no explicit
-  order stored the card shows the auto-detected chain. API keys set here are
-  persisted in the settings document (`role: secret` — redacted on every
-  wire crossing) and **override** the environment variable; unset the key to
-  fall back to `EXA_API_KEY` / `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY`.
-- **In the composition**: the profile's own patch layer —
-  `$DSH_HOME/profiles/web/cordis.patch.yml` (create it if absent; it applies
-  after every bundle layer). A patch **replaces** the row's whole `config`,
-  so state the complete block each time.
+### In the app
 
-The two layers compose field-by-field with the GUI layer winning per field;
-unsetting a field in the GUI (Reset to default) re-inherits the composition
-value. With zero configuration the router auto-detects any provider whose
-key/endpoint is ambient (see below) and tries them in canonical order:
-exa → tavily → brave → searxng.
+**Settings → Plugins → Plugin configuration** shows a "Search router" card:
+one row per active provider, numbered by fallback priority and **draggable to
+reorder** (also keyboard-reorderable), an inline editor per provider, an
+add-provider flow, and an Advanced fold (timeout, empty-results policy). Every
+change applies live — no restart.
 
-### Exa (single provider)
+API keys entered here persist in the settings document as secrets and
+**override** the environment variables; clearing a stored key falls back to
+`EXA_API_KEY` / `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY`.
+
+### In the composition
+
+The profile's own patch layer — `$DSH_HOME/profiles/web/cordis.patch.yml`
+(create it if absent). A patch replaces the row's whole `config`, so state the
+complete block. Two examples:
 
 ```yaml
-- id: search-router
-  config:
-    provider: exa
-    providers:
-      exa:
-        apiKeyEnv: EXA_API_KEY   # default; resolved from env / credential store
-```
-
-### Tavily with fallback to a self-hosted SearXNG
-
-```yaml
+# Tavily, falling back to a self-hosted SearXNG
 - id: search-router
   config:
     order: [tavily, searxng]
     providers:
-      tavily:
-        apiKeyEnv: TAVILY_API_KEY
-      searxng:
-        baseUrl: https://search.example.com
-```
+      tavily: { apiKeyEnv: TAVILY_API_KEY }
+      searxng: { baseUrl: https://search.example.com }
 
-### SearXNG only — no commercial keys anywhere
-
-```yaml
+# SearXNG only — no commercial keys anywhere
 - id: search-router
   config:
     provider: searxng
     providers:
-      searxng:
-        baseUrl: http://127.0.0.1:8888
+      searxng: { baseUrl: http://127.0.0.1:8888 }
 ```
 
-### Full schema
+Full schema:
 
 ```yaml
 - id: search-router
   config:
-    provider: exa            # single-provider mode: one id, no fallback
-    order: [exa, tavily, searxng]  # fallback-chain mode (provider XOR order)
-    timeoutMs: 10000         # per-provider timeout, default 10000
-    emptyResultsFallback: true    # treat 0-result success as failure, default true
+    provider: exa                  # single-provider mode (XOR with order)
+    order: [exa, tavily, searxng]  # fallback-chain mode
+    timeoutMs: 10000               # per-provider timeout (default 10000)
+    emptyResultsFallback: true     # 0-result success counts as failure (default true)
     providers:
-      exa:    { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: https://api.exa.ai }
-      tavily: { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: https://api.tavily.com }
-      brave:  { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: https://api.search.brave.com }
+      exa:    { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: … }
+      tavily: { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: … }
+      brave:  { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: … }
       searxng: { baseUrl: …, baseUrlEnv: SEARXNG_BASE_URL }
-```
+  ```
 
-Prefer `apiKeyEnv` (or plain environment variables) over literal `apiKey`:
-row configs can surface in `dsh --dump-config` output, and env refs keep
-secrets out of files you might commit.
-
-## Environment variables
-
-| Variable | Used by | Meaning |
-| --- | --- | --- |
-| `EXA_API_KEY` | exa | API key (also the credential-store reference) |
-| `TAVILY_API_KEY` | tavily | API key (also the credential-store reference) |
-| `BRAVE_SEARCH_API_KEY` | brave | API key (also the credential-store reference) |
-| `SEARXNG_BASE_URL` | searxng | Instance origin, e.g. `https://search.example.com` |
-
-Keys resolve per search through DSH's own planes: the credentials service
-first (managed store + ranked env layers), then the launch-environment
-snapshot, then the ambient process env. `DEEPSEEK_API_KEY` is **never**
-required — installing this plugin disables the DeepSeek search provider, so
-web search works without any DeepSeek credential.
+Prefer `apiKeyEnv` over a literal `apiKey` in files you might commit.
 
 ## Fallback
 
-A provider counts as failed on network errors, timeouts, any non-2xx HTTP
-status (401/403/429/5xx…), unparseable responses — and, by default, on empty
-result lists (`emptyResultsFallback: false` to change). The router walks the
-chain in order and returns the first non-empty success; the model never sees
-the earlier failures. Only when every provider fails does `web_search` throw
-one aggregated, key-free error:
+A provider counts as failed on network errors, timeouts, any non-2xx status,
+unparseable responses — and by default on empty results
+(`emptyResultsFallback: false` to change). The router walks the chain in order
+and returns the first success; the model never sees the earlier failures. If
+every provider fails, `web_search` throws one aggregated, key-free error:
 
 ```
 search-router: all configured search providers failed:
@@ -167,61 +114,11 @@ search-router: all configured search providers failed:
 - searxng: HTTP 503
 ```
 
-If every provider answers successfully but empty, the truthful empty result is
-returned instead of an error. Cancellation is honored across the whole chain.
-Searches are strictly sequential — no parallel fan-out, by design.
-
-## Verify
-
-```bash
-dsh web --dump-config | grep -A3 'id: search-router'   # row present
-dsh web --dump-config | grep -A2 'id: web$'            # searchProvider: search-router
-```
-
-Then ask the agent something like “search the web for the latest DSH release”
-and watch the log lines:
-
-```
-[dsh-search-router] exa failed: HTTP 429 — falling back to tavily
-```
-
-## Scope (and non-scope)
-
-v0.2.0 is deliberately minimal: four adapters, one router, one settings card,
-one composition patch. Not included on purpose — reranking, RRF, merging,
-caching, history, stats, fetch routing (`web_fetch` stays with DSH), query
-rewriting, custom HTTP providers, parallel search. The `Backend` contract in
-`src/router.js` is the seam where a new provider would slot in.
-
-## Files
-
-```
-dsh-search-router/
-├── package.json          # dsh.bundle.patch + dsh.client declarations
-├── cordis.patch.yml      # composition: insert row, aim the seam, disable deepseek search
-├── README.md
-├── src/
-│   ├── index.js          # cordis plugin glue (name/inject/apply)
-│   ├── router.js         # chain selection, arming, fallback, aggregation
-│   ├── settings.js       # settings schema + composition/settings merge
-│   ├── lib.js            # fetch+timeout+normalization helpers
-│   └── providers/        # exa.js, tavily.js, brave.js, searxng.js
-└── client/
-    └── client.js         # browser half: the Settings → Plugins card
-```
-
 ## Development
 
-`test/integration.mjs` exercises the router against the **real**
-`@deepseek-ai/dsh-web` and `@deepseek-ai/dsh-settings-file` packages with
-local mock provider endpoints (429, timeout, success, empty, settings
-re-routing, merge semantics) — no network, no keys:
-
 ```bash
-node test/integration.mjs /path/to/a/dsh/installation/node_modules
+node test/integration.mjs /path/to/a/dsh/installation/node_modules   # router vs. the real seam, mocked providers
+node test/client-smoke.mjs                                          # browser bundle, the way the shell loads it
 ```
 
-The directory must contain `@deepseek-ai/dsh-web` (any DSH install, e.g. an
-npx cache or the profile's healed `node_modules`). `test/client-smoke.mjs`
-loads the browser bundle the way the web shell does and drives the card
-controller through edit/save against stub scopes: `node test/client-smoke.mjs`.
+MIT.

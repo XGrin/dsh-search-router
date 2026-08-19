@@ -6,7 +6,7 @@
  * `web.results` and carry `title` / `url` / `description` ( Brave bold-marks
  * queries with <b> tags — stripped here) and sometimes `page_age` / `age`.
  */
-import { httpJSON, normalizeSources, clampCount, joinURL } from "../lib.js";
+import { httpJSON, normalizeSources, clampCount, joinURL, USER_AGENT } from "../lib.js";
 
 /** The Brave backend descriptor (see src/router.js for the backend contract). */
 export const brave = {
@@ -23,7 +23,7 @@ export const brave = {
       headers: {
         "x-subscription-token": armed.apiKey,
         accept: "application/json",
-        "user-agent": "dsh-search-router/0.1.0",
+        "user-agent": USER_AGENT,
       },
     }, options);
     return normalizeSources(json?.web?.results, request.maxResults);

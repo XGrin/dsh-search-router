@@ -8,7 +8,7 @@
  * `text` — mapped onto `snippet` by the shared normalizer. No contents are
  * requested by default: MVP keeps the request to the plain search call.
  */
-import { httpJSON, normalizeSources, clampCount } from "../lib.js";
+import { httpJSON, normalizeSources, clampCount, joinURL } from "../lib.js";
 
 /** The Exa backend descriptor (see src/router.js for the backend contract). */
 export const exa = {
@@ -21,7 +21,7 @@ export const exa = {
       query: request.query,
       numResults: clampCount(request.maxResults, 8, 100),
     };
-    const json = await httpJSON(`${armed.baseURL}/search`, {
+    const json = await httpJSON(joinURL(armed.baseURL, "search").href, {
       method: "POST",
       headers: {
         "x-api-key": armed.apiKey,

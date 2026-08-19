@@ -34,7 +34,7 @@ globalThis.__ModuleLoader__ = {
     record = entry;
   },
 };
-await import(pathToFileURL(resolve("client/client.js")).href);
+await import(pathToFileURL(resolve("src/client/client.js")).href);
 check("factory registered on window.__ModuleLoader__", record?.id === "dsh-search-router", record?.id);
 
 /** Minimal React stand-in: createElement returns plain descriptors. */
@@ -172,7 +172,7 @@ check("card declares its locale", card?.options.locale === "searchRouter.card");
 check("card component is a function", typeof card?.component === "function");
 const face = card?.options.inject();
 check("face exposes the store hook", typeof face.hooks?.searchRouterCard?.getSnapshot === "function" && typeof face.hooks?.searchRouterCard?.subscribe === "function");
-check("face exposes the chain actions", ["reorder", "addProvider", "removeProvider", "resetOrder", "writeTimeout", "writeEmptyFallback", "writeSearxngUrl", "resetField", "saveKey"].every((action) => typeof face.actions?.[action] === "function"), Object.keys(face.actions ?? {}));
+check("face exposes the chain actions", ["reorder", "addProvider", "removeProvider", "resetOrder", "writeTimeout", "writeEmptyFallback", "writeSearxngUrl", "resetField", "saveKey", "clearKey", "moveEarlier", "moveLater", "searxngUrl"].every((action) => typeof face.actions?.[action] === "function"), Object.keys(face.actions ?? {}));
 const actions = face.actions;
 
 let state = face.hooks.searchRouterCard.getSnapshot();
@@ -206,6 +206,15 @@ await flush();
 state = face.hooks.searchRouterCard.getSnapshot();
 check("drag reorder commits the new priority", state.chain.join() === "searxng,exa,tavily", state.chain);
 check("last write is the reordered order string", scopeWrites.at(-1)?.value === "searxng, exa, tavily", scopeWrites.at(-1));
+await actions.moveEarlier("tavily");
+await flush();
+state = face.hooks.searchRouterCard.getSnapshot();
+check("keyboard moveEarlier commits", state.chain.join() === "searxng,tavily,exa", state.chain);
+await actions.moveLater("searxng");
+await flush();
+state = face.hooks.searchRouterCard.getSnapshot();
+check("keyboard moveLater commits", state.chain.join() === "tavily,searxng,exa", state.chain);
+
 
 /* remove */
 await actions.removeProvider("tavily");
@@ -269,11 +278,13 @@ check("reset to automatic unsets the user order", scopeWrites.at(-1)?.op === "un
 
 /* issue-1 regression: the add flow must not depend on onChange firing for the default option */
 {
-  const bundle = (await import("node:fs")).readFileSync("client/client.js", "utf8");
+  const bundle = (await import("node:fs")).readFileSync("src/client/client.js", "utf8");
   check("add select carries a placeholder option", /h\("option", \{ value: "", key: "" \}/.test(bundle));
   check("add confirm button starts disabled until a pick", /disabled: pick === "" \|\| props\.disabled/.test(bundle));
   check("cancel and confirm share one button size class", /className: "dsr-btn dsr-btn-confirm"/.test(bundle) && !bundle.includes('className: "dsr-primary"'));
   check("add labels are the short form", bundle.includes('add: "Add",') && bundle.includes('add: "添加",'));
+  check("tail drop zone appends via reorder(_, undefined)", /actions.reorder\(dragId, void 0\)/.test(bundle));
+  check("grip handles keyboard reorder", /event.key === "ArrowUp"/.test(bundle) && /moveEarlier/.test(bundle));
 }
 
 /* render smoke: the component builds a descriptor tree without throwing */

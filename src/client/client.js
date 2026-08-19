@@ -10,13 +10,16 @@
  *
  * The card manages the fallback CHAIN the way the Models page manages
  * providers: one row card per active provider, numbered by priority,
- * draggable to reorder, with credential-state dots, an inline editor per
- * provider, and a dashed "add provider" flow for the rest. Every structural
- * change (drag, add, remove) commits the `order` field immediately through
- * the settings scope; API keys write through the credentials domain and
- * never ride a settings response. With no explicit order stored, the card
- * shows the auto-detected chain (first provider whose key or endpoint is
- * configured) and a banner explaining it.
+ * draggable to reorder (a tail drop zone moves a row to the end; the grip
+ * also reorders by keyboard with ArrowUp/ArrowDown), with credential-state
+ * dots, an inline editor per provider, and a dashed "add provider" flow for
+ * the rest. Every structural change (drag, add, remove) commits the `order`
+ * field immediately through the settings scope. API keys persist in the
+ * settings document as role('secret') fields and override the environment;
+ * the value itself is redacted from every wire crossing, so the card learns
+ * only whether one is stored (the describe sidecar's set flag). With no
+ * explicit order stored, the card shows the auto-detected chain (first
+ * provider whose key or endpoint is configured) and a banner explaining it.
  */
 window.__ModuleLoader__.load({
 	id: "dsh-search-router",
@@ -41,6 +44,8 @@ window.__ModuleLoader__.load({
 		const NAMES = { exa: "Exa", tavily: "Tavily", brave: "Brave", searxng: "SearXNG" };
 		/** Backends that authenticate with an API key. */
 		const KEYED = ["exa", "tavily", "brave"];
+		/** Sentinel row key for the drag-to-end drop zone. */
+		const TAIL = "__tail__";
 		/** Default credential references, mirroring the host schema. */
 		const DEFAULT_KEY_ENVS = { exa: "EXA_API_KEY", tavily: "TAVILY_API_KEY", brave: "BRAVE_SEARCH_API_KEY" };
 
@@ -66,6 +71,9 @@ window.__ModuleLoader__.load({
 .dsr-reset:disabled{cursor:default;opacity:.4}
 .dsr-reset:focus-visible{outline:2px solid var(--dsw-alias-border-l3);outline:none}
 .dsr-rows{flex-direction:column;gap:8px;margin:0;padding:0;list-style:none;display:flex}
+.dsr-tail{border:1px dashed var(--dsw-alias-border-l3);border-radius:8px;justify-content:center;list-style:none;display:flex}
+.dsr-tail[data-over=true]{border-color:var(--dsw-alias-brand-primary)}
+.dsr-taillabel{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;padding:2px 0}
 .dsr-row{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;flex-direction:column;gap:12px;padding:12px 14px;display:flex}
 .dsr-row[data-dragging=true]{opacity:.45}
 .dsr-row[data-dropbefore=true]{border-top:2px solid var(--dsw-alias-brand-primary);margin-top:-1px}
@@ -273,6 +281,33 @@ window.__ModuleLoader__.load({
 				return this.commitChain(this.chain().filter((candidate) => candidate !== id));
 			}
 
+			/** Move one provider one position earlier (keyboard path). */
+			moveEarlier(id) {
+				const ids = this.chain();
+				const at = ids.indexOf(id);
+				if (at <= 0) return Promise.resolve(false);
+				const next = [...ids];
+				next.splice(at, 1);
+				next.splice(at - 1, 0, id);
+				return this.commitChain(next);
+			}
+
+			/** Move one provider one position later (keyboard path). */
+			moveLater(id) {
+				const ids = this.chain();
+				const at = ids.indexOf(id);
+				if (at === -1 || at === ids.length - 1) return Promise.resolve(false);
+				const next = [...ids];
+				next.splice(at, 1);
+				next.splice(at + 1, 0, id);
+				return this.commitChain(next);
+			}
+
+			/** The currently effective searxng endpoint (fresh read). */
+			searxngUrl() {
+				return String(this.sectionValue("searxngBaseUrl") ?? "").trim();
+			}
+
 			/** Drop the explicit order and follow auto-detection again. */
 			resetOrder() {
 				return this.write({ op: "unset", path: ["order"] });
@@ -419,7 +454,10 @@ window.__ModuleLoader__.load({
 						writeSearxngUrl: (text) => this.writeSearxngUrl(text),
 						resetField: (field) => this.resetField(field),
 						saveKey: (id, value) => this.saveKey(id, value),
-						clearKey: (id) => this.clearKey(id)
+						clearKey: (id) => this.clearKey(id),
+						moveEarlier: (id) => this.moveEarlier(id),
+						moveLater: (id) => this.moveLater(id),
+						searxngUrl: () => this.searxngUrl()
 					}
 				};
 			}
@@ -518,8 +556,27 @@ window.__ModuleLoader__.load({
 								endDrag();
 							},
 							onDragEnd: endDrag,
+							onMove: (delta) => {
+								if (delta < 0) props.actions.moveEarlier(id);
+								else props.actions.moveLater(id);
+							},
 							actions: props.actions
-						}))
+						})),
+						dragId !== void 0 ? h("li", {
+							className: "dsr-tail",
+							"data-over": overId === TAIL ? "true" : void 0,
+							onDragOver: (event) => {
+								if (event.dataTransfer.types.includes("text/plain") !== true) return;
+								event.preventDefault();
+								event.dataTransfer.dropEffect = "move";
+								setOverId(TAIL);
+							},
+							onDrop: (event) => {
+								event.preventDefault();
+								if (dragId !== void 0) props.actions.reorder(dragId, void 0);
+								endDrag();
+							}
+						}, h("span", { className: "dsr-taillabel" }, t("dropToEnd"))) : null
 					),
 					state.addable.length > 0 ? (adding ? h(AddProviderCard, {
 						t, addable: state.addable, disabled,
@@ -593,7 +650,15 @@ window.__ModuleLoader__.load({
 				onDragEnd: props.onDragEnd
 			},
 				h("div", { className: "dsr-rowhead" },
-					h("button", { type: "button", className: "dsr-grip", "aria-label": t("dragHandle", { name: NAMES[props.id] ?? props.id }), disabled: props.disabled, tabIndex: -1 }, h(IconGrip)),
+					h("button", { type: "button", className: "dsr-grip", "aria-label": t("dragHandle", { name: NAMES[props.id] ?? props.id }), disabled: props.disabled, onKeyDown: (event) => {
+					if (event.key === "ArrowUp") {
+						event.preventDefault();
+						props.onMove(-1);
+					} else if (event.key === "ArrowDown") {
+						event.preventDefault();
+						props.onMove(1);
+					}
+				} }, h(IconGrip)),
 					h("span", { className: "dsr-rank" }, String(props.rank)),
 					h("span", { className: "dsr-rowname" }, NAMES[props.id] ?? props.id),
 					props.primary ? h("span", { className: "dsr-rowtag" }, t("primaryTag")) : null,
@@ -659,7 +724,7 @@ window.__ModuleLoader__.load({
 						t("searxngBaseUrl"),
 						props.state.searxng.overridden ? h("button", { type: "button", className: "dsr-reset", disabled: props.disabled, onClick: () => {
 							props.actions.resetField("searxngBaseUrl").then(() => {
-								setText("");
+								setText(props.actions.searxngUrl());
 							});
 						} }, t("reset")) : null
 					),
@@ -673,7 +738,7 @@ window.__ModuleLoader__.load({
 				h("div", { className: "dsr-editoractions" },
 					h("button", { type: "button", className: "dsr-btn dsr-btn-confirm", disabled: props.disabled || !changed, onClick: () => {
 						props.actions.writeSearxngUrl(trimmed).then(() => {
-							setText(trimmed);
+							setText(props.actions.searxngUrl());
 						});
 					} }, t("apply"))
 				)
@@ -752,7 +817,8 @@ window.__ModuleLoader__.load({
 			primaryTag: "Primary",
 			edit: "Edit",
 			remove: "Remove",
-			dragHandle: "Reorder {name}",
+			dragHandle: "Reorder {name} (drag, or focus and use arrow keys)",
+			dropToEnd: "Drop to move to the end",
 			addProvider: "Add provider",
 			add: "Add",
 			addPick: "Select a provider…",
@@ -793,7 +859,8 @@ window.__ModuleLoader__.load({
 			primaryTag: "首选",
 			edit: "编辑",
 			remove: "移除",
-			dragHandle: "拖动调整 {name} 的顺序",
+			dragHandle: "拖动调整 {name} 的顺序（或聚焦后用方向键）",
+			dropToEnd: "拖到此处移到末尾",
 			addProvider: "添加提供方",
 			add: "添加",
 			addPick: "选择提供方…",

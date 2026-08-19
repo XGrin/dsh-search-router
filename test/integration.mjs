@@ -443,6 +443,20 @@ console.log("case 13: settings validation refuses contradictory writes");
       error = thrown;
     }
     check("unknown id in order refused", /unknown provider "google"/.test(String(error)), String(error));
+    error = undefined;
+    try {
+      await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: ", ," }]);
+    } catch (thrown) {
+      error = thrown;
+    }
+    check("order that names nothing refused", /names no providers/.test(String(error)), String(error));
+    error = undefined;
+    try {
+      await ctx.settings.mutate("search-router", [{ op: "set", path: ["searxngBaseUrl"], value: "search.example.com" }]);
+    } catch (thrown) {
+      error = thrown;
+    }
+    check("scheme-less searxng URL refused", /http\(s\) URL/.test(String(error)), String(error));
     const views = ctx.settings.describe();
     const view = views.find((candidate) => candidate.ns === "search-router");
     eq("refused writes stored nothing", view?.user, void 0);
@@ -513,6 +527,23 @@ console.log("case 16: a key stored in settings overrides the ambient environment
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+console.log("case 17: provider markup is stripped from snippets");
+{
+  resetBehavior();
+  behavior.brave = { status: 200, body: { web: { results: [
+    { title: "Brave", url: "https://example.com/b1", description: "a <b>bold</b> <a href=\"x\">linked</a> query" },
+  ] } } };
+  const { ctx, restore } = await boot({
+    order: ["brave"],
+    timeoutMs: 2000,
+    providers: { brave: { apiKey: "k", baseURL: `${base}/brave` } },
+  });
+  const result = await ctx.web.search({ query: "strip markup", maxResults: 5 });
+  check("tags removed, text kept", result.sources[0]?.snippet === "a bold linked query", result.sources[0]);
+  await ctx.dispose?.();
+  restore();
 }
 
 console.log("case 15: mergeRuntime layering as a pure function");
