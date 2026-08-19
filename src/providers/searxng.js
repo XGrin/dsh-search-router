@@ -12,11 +12,12 @@
  */
 import { httpJSON, normalizeSources, joinURL, USER_AGENT } from "../lib.js";
 
-/** The SearXNG backend descriptor (see src/router.js for the backend contract). */
-export const searxng = {
+/** The searxng provider descriptor (id from its file name). */
+export default {
   id: "searxng",
   defaultApiKeyEnv: undefined,
   defaultBaseURL: undefined,
+  meta: { label: "SearXNG", sort: 6, baseUrlEnv: "SEARXNG_BASE_URL", baseUrlLabel: "Endpoint", envHint: "SEARXNG_BASE_URL" },
 
   async search(request, armed, options) {
     const url = joinURL(armed.baseURL, "search");

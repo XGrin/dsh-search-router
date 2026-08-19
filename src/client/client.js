@@ -38,16 +38,49 @@ window.__ModuleLoader__.load({
 		const LOCALE_NS = "searchRouter.card";
 		/** The Plugins page's keyed card slot. */
 		const ITEM_SLOT = "settings.plugin.item";
-		/** Backend ids in canonical (auto-detection) order. */
-		const CANONICAL = ["exa", "tavily", "brave", "searxng"];
-		/** Display names for the backends. */
-		const NAMES = { exa: "Exa", tavily: "Tavily", brave: "Brave", searxng: "SearXNG" };
-		/** Backends that authenticate with an API key. */
-		const KEYED = ["exa", "tavily", "brave"];
 		/** Sentinel row key for the drag-to-end drop zone. */
 		const TAIL = "__tail__";
-		/** Default credential references, mirroring the host schema. */
-		const DEFAULT_KEY_ENVS = { exa: "EXA_API_KEY", tavily: "TAVILY_API_KEY", brave: "BRAVE_SEARCH_API_KEY" };
+
+		/**
+		 * Derive the provider catalog from the served settings section: the
+		 * schema's own field set names every provider — `<id>ApiKeyEnv`
+		 * marks a keyed provider, `<id>BaseUrl` an endpoint-configurable
+		 * one, `meta.label` its display name (carried in the serialized
+		 * schema). The card therefore knows no provider ids itself; adding a
+		 * provider file changes nothing here.
+		 * @param scope - the bound `search-router` settings scope.
+		 * @returns {{ ids: string[], keyed: string[], labelOf: (id: string) => string, envOf: (id: string) => string }} the catalog.
+		 */
+		function catalogOf(scope) {
+			const dict = schemaDict(scope.getSnapshot());
+			const ids = [];
+			const keyed = [];
+			const labels = {};
+			const envs = {};
+			const fieldOf = (id) => dict[`${id}Provider`];
+			for (const field of Object.keys(dict)) {
+				const marker = /^(\w+)Provider$/.exec(field);
+				if (marker !== null) {
+					ids.push(marker[1]);
+					const meta = fieldOf(marker[1])?.meta;
+					if (meta !== null && typeof meta === "object" && typeof meta.providerLabel === "string") labels[marker[1]] = meta.providerLabel;
+				}
+			}
+			for (const id of ids) {
+				if (dict[`${id}ApiKeyEnv`] !== undefined) {
+					keyed.push(id);
+					envs[id] = String(scope.getSnapshot().base?.[`${id}ApiKeyEnv`] ?? scope.getSnapshot().value?.[`${id}ApiKeyEnv`] ?? "");
+				}
+			}
+			return { ids, keyed, labelOf: (id) => labels[id] ?? id, envOf: (id) => envs[id] ?? "" };
+		}
+
+		/** Read a serialized schemastery object schema's field table. */
+		function schemaDict(snapshot) {
+			const schema = snapshot?.schema;
+			if (schema === void 0 || typeof schema !== "object") return {};
+			return schema.dict ?? {};
+		}
 
 		//#endregion
 		//#region stylesheet (values mirror the Models settings page)
@@ -147,8 +180,8 @@ window.__ModuleLoader__.load({
 		//#region controller
 
 		/** Split an `order` string into known backend ids, order preserved. */
-		function parseOrder(text) {
-			return String(text ?? "").split(/[\s,]+/u).filter((token) => token.length > 0 && CANONICAL.includes(token));
+		function parseOrder(text, knownIds) {
+			return String(text ?? "").split(/[\s,]+/u).filter((token) => token.length > 0 && knownIds.includes(token));
 		}
 
 		/**
@@ -168,8 +201,9 @@ window.__ModuleLoader__.load({
 				this.status = void 0;
 				this.credentials = {};
 				this.stored = {};
-				for (const id of KEYED) {
-					this.credentials[id] = { ref: DEFAULT_KEY_ENVS[id], configured: false, writable: true };
+				this.catalog = catalogOf(scope);
+				for (const id of this.catalog.keyed) {
+					this.credentials[id] = { ref: this.catalog.envOf(id), configured: false, writable: true };
 					this.stored[id] = false;
 				}
 				scope.subscribe(() => {
@@ -214,14 +248,38 @@ window.__ModuleLoader__.load({
 				return this.stored[id] === true;
 			}
 
-			/** True when the searxng endpoint resolves from the section. */
-			searxngConfigured() {
-				return String(this.sectionValue("searxngBaseUrl") ?? "").trim() !== "";
+			/** True when a base-URL provider's endpoint resolves from the section. */
+			baseUrlConfigured(id) {
+				return String(this.sectionValue(`${id}BaseUrl`) ?? "").trim() !== "";
+			}
+
+			/** True when the served schema carries `<id>BaseUrl`. */
+			hasBaseUrlField(id) {
+				const value = this.snapshotOf().value;
+				return value !== void 0 && `${id}BaseUrl` in value;
+			}
+
+			/** True when the provider has neither a key nor an endpoint to configure. */
+			keyless(id) {
+				return !this.catalog.keyed.includes(id) && !this.hasBaseUrlField(id);
 			}
 
 			/** The provider the Host would currently reach first. */
 			usable(id) {
-				return id === "searxng" ? this.searxngConfigured() : this.keyConfigured(id) || this.keyStored(id);
+				if (this.keyless(id)) return true;
+				if (this.hasBaseUrlField(id)) return this.baseUrlConfigured(id);
+				return this.keyConfigured(id) || this.keyStored(id);
+			}
+
+			/** The currently effective endpoint of a base-URL provider. */
+			endpointUrl(id) {
+				return String(this.sectionValue(`${id}BaseUrl`) ?? "").trim();
+			}
+
+			/** Store (or clear, when blank) one provider's endpoint. */
+			writeEndpoint(id, text) {
+				const trimmed = String(text ?? "").trim();
+				return this.write(trimmed === "" ? { op: "unset", path: [`${id}BaseUrl`] } : { op: "set", path: [`${id}BaseUrl`], value: trimmed });
 			}
 
 			/** True when the user layer carries an explicit order. */
@@ -231,8 +289,8 @@ window.__ModuleLoader__.load({
 
 			/** The chain in priority order: explicit order, else auto-detectable ids. */
 			chain() {
-				if (this.explicitOrder()) return parseOrder(this.sectionValue("order"));
-				return CANONICAL.filter((id) => this.usable(id));
+				if (this.explicitOrder()) return parseOrder(this.sectionValue("order"), this.catalog.ids);
+				return (this.catalog?.ids ?? []).filter((id) => this.usable(id));
 			}
 
 			/* ----------------------------------------------------------- writes */
@@ -281,6 +339,22 @@ window.__ModuleLoader__.load({
 				return this.commitChain(this.chain().filter((candidate) => candidate !== id));
 			}
 
+			/** Drop the explicit order and follow auto-detection again. */
+			resetOrder() {
+				return this.write({ op: "unset", path: ["order"] });
+			}
+
+			/** Store the per-provider timeout. */
+			writeTimeout(value) {
+				if (!Number.isInteger(value) || value < 100) return Promise.resolve(false);
+				return this.write({ op: "set", path: ["timeoutMs"], value });
+			}
+
+			/** Store the empty-results policy. */
+			writeEmptyFallback(value) {
+				return this.write({ op: "set", path: ["emptyResultsFallback"], value });
+			}
+
 			/** Move one provider one position earlier (keyboard path). */
 			moveEarlier(id) {
 				const ids = this.chain();
@@ -301,33 +375,6 @@ window.__ModuleLoader__.load({
 				next.splice(at, 1);
 				next.splice(at + 1, 0, id);
 				return this.commitChain(next);
-			}
-
-			/** The currently effective searxng endpoint (fresh read). */
-			searxngUrl() {
-				return String(this.sectionValue("searxngBaseUrl") ?? "").trim();
-			}
-
-			/** Drop the explicit order and follow auto-detection again. */
-			resetOrder() {
-				return this.write({ op: "unset", path: ["order"] });
-			}
-
-			/** Store the per-provider timeout. */
-			writeTimeout(value) {
-				if (!Number.isInteger(value) || value < 100) return Promise.resolve(false);
-				return this.write({ op: "set", path: ["timeoutMs"], value });
-			}
-
-			/** Store the empty-results policy. */
-			writeEmptyFallback(value) {
-				return this.write({ op: "set", path: ["emptyResultsFallback"], value });
-			}
-
-			/** Store (or clear, when blank) the searxng endpoint. */
-			writeSearxngUrl(text) {
-				const trimmed = String(text ?? "").trim();
-				return this.write(trimmed === "" ? { op: "unset", path: ["searxngBaseUrl"] } : { op: "set", path: ["searxngBaseUrl"], value: trimmed });
 			}
 
 			/** Restore any field to its composition-layer value. */
@@ -355,7 +402,8 @@ window.__ModuleLoader__.load({
 
 			/** Ask the credentials domain about each key's reference. */
 			async readCredentialAvailability() {
-				const refs = KEYED.map((id) => this.credentials[id]?.ref ?? DEFAULT_KEY_ENVS[id]);
+				const keyed = this.catalog.keyed;
+				const refs = keyed.map((id) => this.credentials[id]?.ref ?? this.catalog.envOf(id));
 				let response;
 				try {
 					response = await this.api.credentials.describe({ refs });
@@ -365,9 +413,9 @@ window.__ModuleLoader__.load({
 				if (!response.result.ok) return;
 				const views = response.result.value.credentials;
 				let changed = false;
-				for (const id of KEYED) {
-					const view = views[this.credentials[id]?.ref ?? DEFAULT_KEY_ENVS[id]];
-					const next = { ref: this.credentials[id]?.ref ?? DEFAULT_KEY_ENVS[id], configured: view?.configured ?? false, writable: view?.writable ?? true };
+				for (const id of keyed) {
+					const view = views[this.credentials[id]?.ref ?? this.catalog.envOf(id)];
+					const next = { ref: this.credentials[id]?.ref ?? this.catalog.envOf(id), configured: view?.configured ?? false, writable: view?.writable ?? true };
 					if (next.configured === this.credentials[id].configured && next.writable === this.credentials[id].writable) continue;
 					this.credentials[id] = next;
 					changed = true;
@@ -388,7 +436,7 @@ window.__ModuleLoader__.load({
 				if (view === void 0) return;
 				const set = new Set((view.secrets ?? []).filter((secret) => secret.set === true).map((secret) => secret.path?.[0]));
 				let changed = false;
-				for (const id of KEYED) {
+				for (const id of this.catalog.keyed) {
 					const next = set.has(`${id}ApiKey`);
 					if (next === this.stored[id]) continue;
 					this.stored[id] = next;
@@ -399,7 +447,7 @@ window.__ModuleLoader__.load({
 
 			/** Re-read after the Host reports a change to a watched reference. */
 			refreshCredential(ref) {
-				if (!KEYED.some((id) => (this.credentials[id]?.ref ?? DEFAULT_KEY_ENVS[id]) === ref)) return;
+				if (!this.catalog.keyed.some((id) => (this.credentials[id]?.ref ?? this.catalog.envOf(id)) === ref)) return;
 				this.readCredentialAvailability();
 			}
 
@@ -416,12 +464,13 @@ window.__ModuleLoader__.load({
 					status: this.status,
 					explicit: this.explicitOrder(),
 					chain,
-					addable: CANONICAL.filter((id) => !chain.includes(id)),
-					keys: Object.fromEntries(KEYED.map((id) => [id, { ...this.credentials[id], stored: this.stored[id] }])),
-					searxng: {
-						url: String(this.sectionValue("searxngBaseUrl") ?? ""),
-						overridden: this.overridden("searxngBaseUrl"),
-					},
+					labels: Object.fromEntries(this.catalog.ids.map((id) => [id, this.catalog.labelOf(id)])),
+					addable: this.catalog.ids.filter((id) => !chain.includes(id)),
+					keys: Object.fromEntries(this.catalog.keyed.map((id) => [id, { ...this.credentials[id], stored: this.stored[id] }])),
+					endpoints: Object.fromEntries(this.catalog.ids.filter((id) => this.hasBaseUrlField(id)).map((id) => [id, {
+						url: String(this.sectionValue(`${id}BaseUrl`) ?? ""),
+						overridden: this.overridden(`${id}BaseUrl`),
+					}])),
 					timeoutMs: {
 						value: this.sectionValue("timeoutMs"),
 						overridden: this.overridden("timeoutMs"),
@@ -451,13 +500,13 @@ window.__ModuleLoader__.load({
 						resetOrder: () => this.resetOrder(),
 						writeTimeout: (value) => this.writeTimeout(value),
 						writeEmptyFallback: (value) => this.writeEmptyFallback(value),
-						writeSearxngUrl: (text) => this.writeSearxngUrl(text),
+						writeEndpoint: (id, text) => this.writeEndpoint(id, text),
 						resetField: (field) => this.resetField(field),
 						saveKey: (id, value) => this.saveKey(id, value),
 						clearKey: (id) => this.clearKey(id),
 						moveEarlier: (id) => this.moveEarlier(id),
 						moveLater: (id) => this.moveLater(id),
-						searxngUrl: () => this.searxngUrl()
+						endpointUrl: (id) => this.endpointUrl(id)
 					}
 				};
 			}
@@ -531,9 +580,11 @@ window.__ModuleLoader__.load({
 						state.chain.map((id, index) => h(ProviderRow, {
 							key: id, id, rank: index + 1, t, state, disabled,
 							primary: index === 0,
-							keyState: id === "searxng" ? (state.searxng.url !== "" ? "ok" : "missing") : (state.keys[id]?.configured === true || state.keys[id]?.stored === true) ? "ok" : "missing",
-							keyLabel: id === "searxng" ? (state.searxng.url !== "" ? t("configured") : t("notConfigured")) : (state.keys[id]?.configured === true || state.keys[id]?.stored === true) ? t("configured") : t("notConfigured"),
-							storedKey: id !== "searxng" && state.keys[id]?.stored === true,
+							keyState: props0(state, id).ok ? "ok" : "missing",
+							keyLabel: t(props0(state, id).ok ? "configured" : props0(state, id).kind === "keyless" ? "keyless" : "notConfigured"),
+							storedKey: state.keys[id]?.stored === true,
+							editable: props0(state, id).kind !== "keyless",
+							endpoint: props0(state, id).kind === "endpoint" ? { url: state.endpoints[id]?.url ?? "", overridden: state.endpoints[id]?.overridden === true } : undefined,
 							editing: editing === id,
 							dragging: dragId === id,
 							dropBefore: overId === id && dragId !== void 0 && dragId !== id,
@@ -600,6 +651,7 @@ window.__ModuleLoader__.load({
 		/** The add flow: a placeholder select plus an explicit confirm button. */
 		function AddProviderCard(props) {
 			const { t } = props;
+			const stateLabels = props.stateLabels ?? {};
 			const [pick, setPick] = useState("");
 			return h("div", { className: "dsr-addcard" },
 				h("div", { className: "dsr-field" },
@@ -610,7 +662,7 @@ window.__ModuleLoader__.load({
 						onChange: (event) => {
 							setPick(event.target.value);
 						}
-					}, [h("option", { value: "", key: "" }, t("addPick")), ...props.addable.map((id) => h("option", { value: id, key: id }, NAMES[id] ?? id))])
+					}, [h("option", { value: "", key: "" }, t("addPick")), ...props.addable.map((id) => h("option", { value: id, key: id }, props.stateLabels[id] ?? id))])
 				),
 				h("div", { className: "dsr-editoractions" },
 					h("button", { type: "button", className: "dsr-btn", onClick: props.onCancel }, t("cancel")),
@@ -619,6 +671,15 @@ window.__ModuleLoader__.load({
 					} }, t("add"))
 				)
 			);
+		}
+
+		/** One provider's readiness projection for the row chrome. */
+		function props0(state, id) {
+			if (state.keys[id]?.configured === true || state.keys[id]?.stored === true) return { kind: "key", ok: true };
+			const endpoint = state.endpoints?.[id];
+			if (endpoint !== undefined) return { kind: "endpoint", ok: endpoint.url !== "" };
+			if (state.keys[id] !== undefined) return { kind: "key", ok: false };
+			return { kind: "keyless", ok: true };
 		}
 
 		/** One provider in the chain: rank, name, credential dot, actions. */
@@ -650,7 +711,7 @@ window.__ModuleLoader__.load({
 				onDragEnd: props.onDragEnd
 			},
 				h("div", { className: "dsr-rowhead" },
-					h("button", { type: "button", className: "dsr-grip", "aria-label": t("dragHandle", { name: NAMES[props.id] ?? props.id }), disabled: props.disabled, onKeyDown: (event) => {
+					h("button", { type: "button", className: "dsr-grip", "aria-label": t("dragHandle", { name: props.label }), disabled: props.disabled, onKeyDown: (event) => {
 					if (event.key === "ArrowUp") {
 						event.preventDefault();
 						props.onMove(-1);
@@ -660,15 +721,15 @@ window.__ModuleLoader__.load({
 					}
 				} }, h(IconGrip)),
 					h("span", { className: "dsr-rank" }, String(props.rank)),
-					h("span", { className: "dsr-rowname" }, NAMES[props.id] ?? props.id),
+					h("span", { className: "dsr-rowname" }, props.label),
 					props.primary ? h("span", { className: "dsr-rowtag" }, t("primaryTag")) : null,
 					h("span", { className: "dsr-dot", "data-state": props.keyState, role: "img", "aria-label": props.keyLabel, title: props.keyLabel }),
 					h("span", { className: "dsr-rowactions" },
-						h("button", { type: "button", className: "dsr-btn", disabled: props.disabled, onClick: props.onEdit }, t("edit")),
+						props.editable ? h("button", { type: "button", className: "dsr-btn", disabled: props.disabled, onClick: props.onEdit }, t("edit")) : null,
 						h("button", { type: "button", className: "dsr-btn dsr-btn-danger", disabled: props.disabled, onClick: props.onRemove }, t("remove"))
 					)
 				),
-				props.editing ? (props.id === "searxng" ? h(SearxngEditor, { t, state: props.state, disabled: props.disabled, actions: props.actions }) : h(KeyEditor, { id: props.id, t, state: props.state, disabled: props.disabled, actions: props.actions })) : null
+				props.editing ? (props.endpoint !== undefined ? h(EndpointEditor, { id: props.id, endpoint: props.endpoint, state: props.state, t, disabled: props.disabled, actions: props.actions }) : h(KeyEditor, { id: props.id, t, state: props.state, disabled: props.disabled, actions: props.actions })) : null
 			);
 		}
 
@@ -681,7 +742,7 @@ window.__ModuleLoader__.load({
 			const blocked = props.disabled || trimmed === "";
 			return h("div", { className: "dsr-editor" },
 				h("div", { className: "dsr-editorhead" },
-					h("span", { className: "dsr-editortitle" }, NAMES[props.id] ?? props.id),
+					h("span", { className: "dsr-editortitle" }, props.state.labels[props.id] ?? props.id),
 					h("span", { className: "dsr-editorsub" }, key.stored === true ? t("storedKey") : key.configured === true ? t("envKey", { ref: key.ref ?? "" }) : t("noKey"))
 				),
 				h("div", { className: "dsr-field" },
@@ -709,27 +770,27 @@ window.__ModuleLoader__.load({
 		}
 
 		/** The inline endpoint editor for SearXNG. */
-		function SearxngEditor(props) {
+		function EndpointEditor(props) {
 			const { t } = props;
-			const [text, setText] = useState(props.state.searxng.url);
+			const [text, setText] = useState(props.endpoint.url);
 			const trimmed = text.trim();
-			const changed = trimmed !== props.state.searxng.url;
+			const changed = trimmed !== props.endpoint.url;
 			return h("div", { className: "dsr-editor" },
 				h("div", { className: "dsr-editorhead" },
-					h("span", { className: "dsr-editortitle" }, "SearXNG"),
-					h("span", { className: "dsr-editorsub" }, t("searxngSub"))
+					h("span", { className: "dsr-editortitle" }, props.state.labels[props.id] ?? props.id),
+					h("span", { className: "dsr-editorsub" }, t("selfHostedSub"))
 				),
 				h("div", { className: "dsr-field" },
 					h("span", { className: "dsr-fieldlabel" },
-						t("searxngBaseUrl"),
-						props.state.searxng.overridden ? h("button", { type: "button", className: "dsr-reset", disabled: props.disabled, onClick: () => {
-							props.actions.resetField("searxngBaseUrl").then(() => {
-								setText(props.actions.searxngUrl());
+						t("endpoint"),
+						props.endpoint.overridden ? h("button", { type: "button", className: "dsr-reset", disabled: props.disabled, onClick: () => {
+							props.actions.resetField(`${props.id}BaseUrl`).then(() => {
+								setText(props.actions.endpointUrl(props.id));
 							});
 						} }, t("reset")) : null
 					),
 					h("input", {
-						className: "dsr-input", type: "text", value: text, disabled: props.disabled, placeholder: t("searxngPlaceholder"),
+						className: "dsr-input", type: "text", value: text, disabled: props.disabled, placeholder: t("endpointPlaceholder"),
 						onChange: (event) => {
 							setText(event.target.value);
 						}
@@ -737,8 +798,8 @@ window.__ModuleLoader__.load({
 				),
 				h("div", { className: "dsr-editoractions" },
 					h("button", { type: "button", className: "dsr-btn dsr-btn-confirm", disabled: props.disabled || !changed, onClick: () => {
-						props.actions.writeSearxngUrl(trimmed).then(() => {
-							setText(props.actions.searxngUrl());
+						props.actions.writeEndpoint(props.id, trimmed).then(() => {
+							setText(props.actions.endpointUrl(props.id));
 						});
 					} }, t("apply"))
 				)
@@ -833,9 +894,10 @@ window.__ModuleLoader__.load({
 			clearKey: "Clear stored key",
 			configured: "Configured",
 			notConfigured: "Not configured",
-			searxngSub: "Self-hosted — no API key",
-			searxngBaseUrl: "Endpoint",
-			searxngPlaceholder: "https://search.example.com (blank: SEARXNG_BASE_URL)",
+			selfHostedSub: "Self-hosted — no API key",
+			endpoint: "Endpoint",
+			keyless: "Keyless",
+			endpointPlaceholder: "https://search.example.com",
 			advanced: "Advanced",
 			reset: "Reset",
 			timeoutMs: "Timeout per provider (ms)",
@@ -875,9 +937,10 @@ window.__ModuleLoader__.load({
 			clearKey: "清除已存密钥",
 			configured: "已配置",
 			notConfigured: "未配置",
-			searxngSub: "自托管，无需 API Key",
-			searxngBaseUrl: "实例地址",
-			searxngPlaceholder: "https://search.example.com（留空使用 SEARXNG_BASE_URL）",
+			selfHostedSub: "自托管，无需 API Key",
+			endpoint: "实例地址",
+			keyless: "无需密钥",
+			endpointPlaceholder: "https://search.example.com",
 			advanced: "高级",
 			reset: "重置",
 			timeoutMs: "单个提供方超时（毫秒）",

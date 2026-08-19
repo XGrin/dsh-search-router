@@ -39,21 +39,41 @@ const behavior = {
     { title: "Tavily one", url: "https://example.com/t1", content: "tavily result", published_date: "Mon, 01 Jan 2029 00:00:00 GMT" },
   ] } },
   brave: { status: 401, body: {} },
+  perplexity: { status: 200, body: { results: [
+    { title: "Perplexity one", url: "https://example.com/p1", date: "2026-01-02", text: "perplexity result with <b>markup</b>" },
+  ] } },
+  deepseek: { status: 200, body: { content: [
+    { type: "web_search_tool_result", content: [
+      { type: "web_search_result", url: "https://example.com/d1", title: "DeepSeek one", page_age: "2026-01-01" },
+      { type: "web_search_result", url: "https://example.com/d2", title: "DeepSeek two" },
+    ] },
+    { type: "text", text: "answer", citations: [
+      { url: "https://example.com/d1", cited_text: "cited excerpt for d1" },
+      { url: "https://example.com/d2", cited_text: "" },
+    ] },
+  ] } },
   searxng: { status: 200, body: { results: [
     { title: "SearXNG one", url: "https://example.com/s1", content: "searxng result" },
   ] } },
+  duckduckgo: { status: 200, html: `<a class="result__a" href="https://example.com/g1">DDG <b>one</b></a>
+    <a class="result__snippet">ddg snippet one</a>
+    <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fg2&amp;rut=abc">DDG two</a>
+    <a class="result__snippet">ddg snippet two</a>` },
   hang: true,
 };
 
-const seen = { exa: [], tavily: [], brave: [], searxng: [] };
+const seen = { exa: [], tavily: [], brave: [], perplexity: [], deepseek: [], searxng: [], duckduckgo: [] };
 
 /** Restore the default mock behaviors (cases mutate them). */
-const defaults = structuredClone({ exa: behavior.exa, tavily: behavior.tavily, brave: behavior.brave, searxng: behavior.searxng });
+const defaults = structuredClone({ exa: behavior.exa, tavily: behavior.tavily, brave: behavior.brave, perplexity: behavior.perplexity, deepseek: behavior.deepseek, searxng: behavior.searxng, duckduckgo: behavior.duckduckgo });
 const resetBehavior = () => {
   Object.assign(behavior.exa, structuredClone(defaults.exa));
   Object.assign(behavior.tavily, structuredClone(defaults.tavily));
   Object.assign(behavior.brave, structuredClone(defaults.brave));
+  Object.assign(behavior.perplexity, structuredClone(defaults.perplexity));
+  Object.assign(behavior.deepseek, structuredClone(defaults.deepseek));
   Object.assign(behavior.searxng, structuredClone(defaults.searxng));
+  Object.assign(behavior.duckduckgo, structuredClone(defaults.duckduckgo));
   behavior.hang = true;
 };
 
@@ -80,6 +100,20 @@ const server = createServer((request, response) => {
     if (request.url?.startsWith("/brave/")) {
       seen.brave.push({ url: request.url, body: chunks });
       return send(behavior.brave);
+    }
+    if (request.url?.startsWith("/perplexity/")) {
+      seen.perplexity.push({ url: request.url, body: chunks });
+      return send(behavior.perplexity);
+    }
+    if (request.url?.startsWith("/deepseek/")) {
+      seen.deepseek.push({ url: request.url, body: chunks });
+      return send(behavior.deepseek);
+    }
+    if (request.url?.startsWith("/duckduckgo/")) {
+      seen.duckduckgo.push({ url: request.url, body: chunks });
+      response.writeHead(behavior.duckduckgo.status, { "content-type": "text/html" });
+      response.end(behavior.duckduckgo.html ?? "");
+      return;
     }
     if (request.url?.startsWith("/searxng/")) {
       seen.searxng.push({ url: request.url, body: chunks });
@@ -149,7 +183,10 @@ const providersBase = (over = {}) => ({
   exa: { apiKey: "test-exa-key", baseURL: `${base}/exa` },
   tavily: { apiKey: "test-tavily-key", baseURL: `${base}/tavily` },
   brave: { apiKey: "test-brave-key", baseURL: `${base}/brave` },
+  perplexity: { apiKey: "test-pplx-key", baseURL: `${base}/perplexity` },
+  deepseek: { apiKey: "test-deepseek-key", baseURL: `${base}/deepseek` },
   searxng: { baseUrl: `${base}/searxng` },
+  duckduckgo: { baseURL: `${base}/duckduckgo` },
   ...over,
 });
 
@@ -329,18 +366,17 @@ console.log("case 8: auto-detection from ambient env + available()");
   restore();
 }
 
-console.log("case 9: nothing configured — clear setup error");
+console.log("case 9: nothing configured — DuckDuckGo keeps the chain usable");
 {
-  const { ctx, restore } = await boot({ timeoutMs: 2000 }, { EXA_API_KEY: undefined, TAVILY_API_KEY: undefined, BRAVE_SEARCH_API_KEY: undefined, SEARXNG_BASE_URL: undefined });
+  resetBehavior();
+  const { ctx, restore } = await boot(
+    { timeoutMs: 2000, providers: { duckduckgo: { baseURL: `${base}/duckduckgo` } } },
+    { EXA_API_KEY: undefined, TAVILY_API_KEY: undefined, BRAVE_SEARCH_API_KEY: undefined, SEARXNG_BASE_URL: undefined },
+  );
   const provider = [...ctx.web.searchProviders.values()].find((p) => p.id === "search-router");
-  check("available() false with nothing configured", provider?.available() === false);
-  let error;
-  try {
-    await ctx.web.search({ query: "void", maxResults: 5 });
-  } catch (thrown) {
-    error = thrown;
-  }
-  check("seam reports unavailable provider", /unavailable|no search provider/i.test(String(error)), String(error));
+  check("available() true via keyless DuckDuckGo", provider?.available() === true);
+  const result = await ctx.web.search({ query: "void", maxResults: 5 });
+  check("zero-config search served by DuckDuckGo", result.sources.length === 2 && result.sources[0]?.url === "https://example.com/g1", result.sources);
   await ctx.cleanup?.() ?? await ctx.dispose?.();
   restore();
 }
@@ -377,16 +413,14 @@ console.log("case 11: settings section is served for the Plugins page");
     const view = views.find((candidate) => candidate.ns === "search-router");
     check("namespace registered", view !== undefined, views.map((v) => v.ns));
     check("applies live", view?.applies === "live", view?.applies);
-    eq("base projects the composition", view?.base, {
+    const expectedSection = {
       provider: "exa", order: "", timeoutMs: 2000, emptyResultsFallback: true,
       exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
-      searxngBaseUrl: `${base}/searxng`, searxngBaseUrlEnv: "",
-    });
-    eq("resolved section carries schema defaults over base", view?.value, {
-      provider: "exa", order: "", timeoutMs: 2000, emptyResultsFallback: true,
-      exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
-      searxngBaseUrl: `${base}/searxng`, searxngBaseUrlEnv: "",
-    });
+      perplexityApiKeyEnv: "PPLX_API_KEY", deepseekApiKeyEnv: "DEEPSEEK_API_KEY",
+      searxngBaseUrl: `${base}/searxng`,
+    };
+    eq("base projects the composition", view?.base, expectedSection);
+    eq("resolved section carries schema defaults over base", view?.value, expectedSection);
     await ctx.dispose?.();
     restore();
   } finally {
@@ -546,11 +580,64 @@ console.log("case 17: provider markup is stripped from snippets");
   restore();
 }
 
+console.log("case 18: perplexity, deepseek, duckduckgo backends");
+{
+  resetBehavior();
+  const bootOne = async (provider) => boot({
+    provider,
+    timeoutMs: 2000,
+    providers: providersBase(),
+  });
+  {
+    const { ctx, restore } = await bootOne("perplexity");
+    const pplx = await ctx.web.search({ query: "pplx", maxResults: 5 });
+    eq("perplexity normalizes date/text, strips markup", pplx.sources, [
+      { url: "https://example.com/p1", title: "Perplexity one", snippet: "perplexity result with markup", publishedAt: "2026-01-02" },
+    ]);
+    check("perplexity sends model + bearer auth", seen.perplexity.at(-1)?.body.includes('"model"') && seen.perplexity.at(-1)?.body.includes('"sonar"'), seen.perplexity.at(-1));
+    await ctx.cleanup?.() ?? await ctx.dispose?.();
+    restore();
+  }
+  {
+    const { ctx, restore } = await bootOne("deepseek");
+    const ds = await ctx.web.search({ query: "ds", maxResults: 5 });
+    eq("deepseek joins citations as snippets", ds.sources, [
+      { url: "https://example.com/d1", title: "DeepSeek one", snippet: "cited excerpt for d1", publishedAt: "2026-01-01" },
+      { url: "https://example.com/d2", title: "DeepSeek two" },
+    ]);
+    check("deepseek sends the web_search tool", seen.deepseek.at(-1)?.body.includes("web_search_20250305"), seen.deepseek.at(-1));
+    await ctx.cleanup?.() ?? await ctx.dispose?.();
+    restore();
+  }
+  {
+    const { ctx, restore } = await bootOne("duckduckgo");
+    const ddg = await ctx.web.search({ query: "ddg", maxResults: 5 });
+    eq("duckduckgo parses SERP, unwraps redirects, strips markup", ddg.sources, [
+      { url: "https://example.com/g1", title: "DDG one", snippet: "ddg snippet one" },
+      { url: "https://example.com/g2", title: "DDG two", snippet: "ddg snippet two" },
+    ]);
+    behavior.duckduckgo = { status: 200, html: "<html><body>no results here</body></html>" };
+    const empty = await ctx.web.search({ query: "empty ddg", maxResults: 5 });
+    eq("unparseable SERP reads as 0 results", empty.sources, []);
+    behavior.duckduckgo = { status: 403, html: "" };
+    let error;
+    try {
+      await ctx.web.search({ query: "blocked ddg", maxResults: 5 });
+    } catch (thrown) {
+      error = thrown;
+    }
+    check("HTTP failure surfaces in the aggregate", /duckduckgo: HTTP 403/.test(String(error)), String(error));
+    await ctx.cleanup?.() ?? await ctx.dispose?.();
+    restore();
+  }
+}
+
 console.log("case 15: mergeRuntime layering as a pure function");
 {
-  const composition = settingsExports.projectBase;
-  const base = composition({ provider: "exa", order: undefined, timeoutMs: 5000, emptyResultsFallback: true, providers: {} });
-  const merge = (resolved) => settingsExports.mergeRuntime({ provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {} }, resolved, base);
+  const { BACKENDS } = await import(pathToFileURL(resolve("src/router.js")).href);
+  const catalog = settingsExports.providerCatalog(BACKENDS);
+  const base = settingsExports.projectBase(catalog)({ provider: "exa", order: undefined, timeoutMs: 5000, emptyResultsFallback: true, providers: {} });
+  const merge = (resolved) => settingsExports.mergeRuntime(catalog)({ provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {} }, resolved, base);
   eq("identical resolution inherits the composition", merge(structuredClone(base)), {
     provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
   });
@@ -566,6 +653,11 @@ console.log("case 15: mergeRuntime layering as a pure function");
   eq("undefined section is the composition itself", merge(void 0), {
     provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
   });
+  eq("stored key becomes the provider's literal apiKey", settingsExports.mergeRuntime(catalog)(
+    { timeoutMs: 5000, providers: {} },
+    { ...structuredClone(base), provider: "", tavilyApiKey: "k" },
+    base,
+  ).providers.tavily, { apiKey: "k" });
 }
 
 /* ------------------------------------------------------------------- done */

@@ -9,11 +9,12 @@
  */
 import { httpJSON, normalizeSources, clampCount, joinURL } from "../lib.js";
 
-/** The Tavily backend descriptor (see src/router.js for the backend contract). */
-export const tavily = {
+/** The tavily provider descriptor (id from its file name). */
+export default {
   id: "tavily",
   defaultApiKeyEnv: "TAVILY_API_KEY",
   defaultBaseURL: "https://api.tavily.com",
+  meta: { label: "Tavily", sort: 2 },
 
   async search(request, armed, options) {
     const body = {

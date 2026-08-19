@@ -21,8 +21,8 @@
  * This plugin does not provide a search engine. It routes DSH's native
  * web_search capability to user-configured search providers.
  */
-import { parseConfig, createRouterProvider } from "./router.js";
-import { SETTINGS_NS, SettingsConfig, projectBase, mergeRuntime, validateSection } from "./settings.js";
+import { parseConfig, createRouterProvider, BACKENDS } from "./router.js";
+import { SETTINGS_NS, settingsConfig, projectBase, mergeRuntime, validateSection, providerCatalog } from "./settings.js";
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = "search-router";
@@ -41,17 +41,18 @@ export const inject = ["web"];
  */
 export function apply(ctx, config) {
   const composition = parseConfig(config);
-  const base = projectBase(composition);
+  const catalog = providerCatalog(BACKENDS);
+  const base = projectBase(catalog)(composition);
   let section;
   ctx.inject(["settings"], (sctx) => {
-    const scope = sctx.settings.register(SETTINGS_NS, SettingsConfig, {
+    const scope = sctx.settings.register(SETTINGS_NS, settingsConfig(catalog), {
       base,
-      validate: validateSection,
+      validate: validateSection(catalog),
     });
     section = () => scope.get();
     sctx.effect(() => () => {
       section = undefined;
     }, "search-router: settings section");
   });
-  ctx.web.registerSearchProvider(createRouterProvider(ctx, () => mergeRuntime(composition, section?.(), base)));
+  ctx.web.registerSearchProvider(createRouterProvider(ctx, () => mergeRuntime(catalog)(composition, section?.(), base)));
 }

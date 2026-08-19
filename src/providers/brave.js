@@ -8,11 +8,12 @@
  */
 import { httpJSON, normalizeSources, clampCount, joinURL, USER_AGENT } from "../lib.js";
 
-/** The Brave backend descriptor (see src/router.js for the backend contract). */
-export const brave = {
+/** The brave provider descriptor (id from its file name). */
+export default {
   id: "brave",
   defaultApiKeyEnv: "BRAVE_SEARCH_API_KEY",
   defaultBaseURL: "https://api.search.brave.com",
+  meta: { label: "Brave", sort: 3 },
 
   async search(request, armed, options) {
     const url = joinURL(armed.baseURL, "res/v1/web/search");

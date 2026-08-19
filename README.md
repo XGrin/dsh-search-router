@@ -19,12 +19,17 @@ DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Br
 | **Exa** | `EXA_API_KEY` | `https://api.exa.ai` |
 | **Tavily** | `TAVILY_API_KEY` | `https://api.tavily.com` |
 | **Brave** | `BRAVE_SEARCH_API_KEY` | `https://api.search.brave.com` |
+| **Perplexity** | `PPLX_API_KEY` | `https://api.perplexity.ai` |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1` |
 | **SearXNG** | none (self-hosted) | `SEARXNG_BASE_URL` |
+| **DuckDuckGo** | none | — |
 
 SearXNG keeps the router fully self-hostable — no commercial API needed. The
 instance must enable the `json` output format (`search.formats` in its
-`settings.yml`). Endpoints of the three commercial providers can be overridden
-per provider (see the full schema below).
+`settings.yml`). DuckDuckGo is keyless, so a zero-configuration deployment
+still serves web searches out of the box. Provider endpoints (and the
+Perplexity/DeepSeek model) can be overridden per provider (see the full
+schema below).
 
 ## Install
 
@@ -50,7 +55,7 @@ restores the original composition.
 Two ways, targeting the same knobs — the GUI wins per field, and a GUI reset
 re-inherits the composition value. With zero configuration the router
 auto-detects every provider whose key or endpoint is ambient, in canonical
-order: exa → tavily → brave → searxng.
+order: exa → tavily → brave → perplexity → deepseek → searxng → duckduckgo.
 
 ### In the app
 
@@ -97,10 +102,13 @@ Full schema:
     timeoutMs: 10000               # per-provider timeout (default 10000)
     emptyResultsFallback: true     # 0-result success counts as failure (default true)
     providers:
-      exa:    { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: … }
-      tavily: { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: … }
-      brave:  { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: … }
-      searxng: { baseUrl: …, baseUrlEnv: SEARXNG_BASE_URL }
+      exa:        { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: … }
+      tavily:     { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: … }
+      brave:      { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: … }
+      perplexity: { apiKey: …, apiKeyEnv: PPLX_API_KEY, baseURL: …, model: sonar }
+      deepseek:   { apiKey: …, apiKeyEnv: DEEPSEEK_API_KEY, baseURL: …, model: deepseek-v4-flash }
+      searxng:    { baseUrl: …, baseUrlEnv: SEARXNG_BASE_URL }
+      duckduckgo: { baseURL: … }
   ```
 
 Prefer `apiKeyEnv` over a literal `apiKey` in files you might commit.

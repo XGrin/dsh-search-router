@@ -19,15 +19,26 @@ import z from "@deepseek-ai/schemastery";
 /** Settings namespace this plugin serves (== the plugin's short name). */
 export const SETTINGS_NS = "search-router";
 
-/** Known backend ids, in canonical auto-detection order. */
-export const BACKEND_IDS = ["exa", "tavily", "brave", "searxng"];
-
-/** Default env-var names for the three commercial keys. */
-export const DEFAULT_KEY_ENVS = {
-  exa: "EXA_API_KEY",
-  tavily: "TAVILY_API_KEY",
-  brave: "BRAVE_SEARCH_API_KEY",
-};
+/**
+ * The provider catalog, derived from the router's discovered backends: every
+ * field of the settings schema and every shape the card renders comes from a
+ * provider's own descriptor (`id`, `defaultApiKeyEnv`, `meta`), so adding a
+ * provider file changes nothing here.
+ *
+ * @param {Record<string, object>} backends - the router's BACKENDS index.
+ * @returns {{ ids: string[], keyed: string[], keyless: string[], envOf: (id: string) => string|undefined, labelOf: (id: string) => string }} the catalog.
+ */
+export function providerCatalog(backends) {
+  CATALOG_BACKEND = backends;
+  const ids = Object.keys(backends).sort((a, b) => (backends[a].meta?.sort ?? 99) - (backends[b].meta?.sort ?? 99) || a.localeCompare(b));
+  return {
+    ids,
+    keyed: ids.filter((id) => backends[id].defaultApiKeyEnv !== undefined),
+    keyless: ids.filter((id) => backends[id].defaultApiKeyEnv === undefined),
+    envOf: (id) => backends[id].defaultApiKeyEnv,
+    labelOf: (id) => backends[id].meta?.label ?? id,
+  };
+}
 
 /**
  * The settings section schema. Field semantics:
@@ -40,21 +51,40 @@ export const DEFAULT_KEY_ENVS = {
  *   reference for that provider (`role('secret')`: the wire redacts it, the
  *   settings document persists it); absent = resolve from the environment;
  * - `*ApiKeyEnv` — credential-reference names the router resolves per search;
- * - `searxngBaseUrl` / `searxngBaseUrlEnv` — the self-hosted endpoint.
+ * - `<id>BaseUrl` — the endpoint field of a base-URL provider.
  */
-export const SettingsConfig = z.object({
-  provider: z.union([z.const(""), z.const("exa"), z.const("tavily"), z.const("brave"), z.const("searxng")]).default(""),
+/**
+ * Build the settings section schema for one provider catalog. Field
+ * semantics (per provider `<id>` from the catalog):
+ * - `provider` — single-backend mode ("" = not chosen here);
+ * - `order` — fallback-chain mode as a comma/space-separated id list;
+ * - `timeoutMs` / `emptyResultsFallback` — router-wide policy;
+ * - `<id>ApiKey` — a stored key OVERRIDING the environment for keyed
+ *   providers (`role('secret')`: persisted, redacted from every response);
+ * - `<id>ApiKeyEnv` — the credential reference a keyed provider resolves;
+ * - `<id>BaseUrl` — the endpoint field of a base-URL provider (SearXNG).
+ *
+ * @param {ReturnType<providerCatalog>} catalog - the provider catalog.
+ * @returns {z} the section schema.
+ */
+export const settingsConfig = (catalog) => z.object({
+  provider: z.union([z.const(""), ...catalog.ids.map((id) => z.const(id))]).default(""),
   order: z.string().default(""),
   timeoutMs: z.number().step(1).min(100).default(10000),
   emptyResultsFallback: z.boolean().default(true),
-  exaApiKey: z.string().role("secret"),
-  tavilyApiKey: z.string().role("secret"),
-  braveApiKey: z.string().role("secret"),
-  exaApiKeyEnv: z.string().role("credential-ref").default(DEFAULT_KEY_ENVS.exa),
-  tavilyApiKeyEnv: z.string().role("credential-ref").default(DEFAULT_KEY_ENVS.tavily),
-  braveApiKeyEnv: z.string().role("credential-ref").default(DEFAULT_KEY_ENVS.brave),
-  searxngBaseUrl: z.string().default(""),
-  searxngBaseUrlEnv: z.string().default(""),
+  ...Object.fromEntries(catalog.keyed.flatMap((id) => [
+    [`${id}ApiKey`, z.string().role("secret")],
+    [`${id}ApiKeyEnv`, z.string().role("credential-ref").default(catalog.envOf(id))],
+  ])),
+  ...Object.fromEntries(catalog.ids.filter((id) => needsBaseUrl(catalog, id)).map((id) => [`${id}BaseUrl`, z.string().default("")])),
+  // One declared field per provider carries its existence and display label
+  // to the browser half — including pure keyless providers that have no
+  // other field — so the card's catalog is complete without hardcoding ids.
+  ...Object.fromEntries(catalog.ids.map((id) => {
+    const marker = z.const(true);
+    marker.meta = { ...marker.meta, providerLabel: labelOf(id) };
+    return [`${id}Provider`, marker];
+  })),
 });
 
 /**
@@ -64,11 +94,11 @@ export const SettingsConfig = z.object({
  * @param {string} text - comma/space-separated backend ids.
  * @returns {string[]} the parsed, deduped id list.
  */
-export function parseOrderString(text) {
+export function parseOrderString(text, knownIds) {
   const ids = String(text ?? "").split(/[\s,]+/u).filter((token) => token.length > 0);
   for (const id of ids) {
-    if (!BACKEND_IDS.includes(id)) {
-      throw new Error(`search-router: unknown provider "${id}" in order (expected ${BACKEND_IDS.join(", ")})`);
+    if (!knownIds.includes(id)) {
+      throw new Error(`search-router: unknown provider "${id}" in order (expected ${knownIds.join(", ")})`);
     }
   }
   return [...new Set(ids)];
@@ -81,7 +111,7 @@ export function parseOrderString(text) {
  *
  * @param {object} section - the resolved settings section.
  */
-export function validateSection(section) {
+export const validateSection = (catalog) => (section) => {
   if (section.provider !== "" && section.order.trim() !== "") {
     throw new Error('search-router: set either "provider" (single) or "order" (fallback chain), not both');
   }
@@ -89,27 +119,43 @@ export function validateSection(section) {
     // ", ," parses to zero providers; an order that names nothing would
     // silently empty the chain, so refuse it at the same layer the
     // composition's parseConfig refuses an empty array.
-    if (parseOrderString(section.order).length === 0) {
-      throw new Error(`search-router: "order" names no providers (expected ${BACKEND_IDS.join(", ")})`);
+    if (parseOrderString(section.order, catalog.ids).length === 0) {
+      throw new Error(`search-router: "order" names no providers (expected ${catalog.ids.join(", ")})`);
     }
   }
-  const searxngUrl = String(section.searxngBaseUrl ?? "").trim();
-  if (searxngUrl !== "") {
+  for (const id of catalog.ids.filter((candidate) => needsBaseUrl(catalog, candidate))) {
+    const url = String(section[`${id}BaseUrl`] ?? "").trim();
+    if (url === "") continue;
     let parsed;
     try {
-      parsed = new URL(searxngUrl);
+      parsed = new URL(url);
     } catch {
-      throw new Error("search-router: searxngBaseUrl must be a valid http(s) URL");
+      throw new Error(`search-router: ${id}BaseUrl must be a valid http(s) URL`);
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      throw new Error("search-router: searxngBaseUrl must be an http(s) URL");
+      throw new Error(`search-router: ${id}BaseUrl must be an http(s) URL`);
     }
   }
-  for (const field of ["exaApiKey", "tavilyApiKey", "braveApiKey"]) {
+  for (const id of catalog.keyed) {
+    const field = `${id}ApiKey`;
     if (section[field] !== undefined && String(section[field]).trim() === "") {
       throw new Error(`search-router: ${field} must be non-empty when set (unset it to fall back to the environment)`);
     }
   }
+};
+
+/** A provider's display label (meta.label, else the id). */
+function labelOf(id) {
+  return CATALOG_BACKEND?.[id]?.meta?.label ?? id;
+}
+
+/** The backend index the module last built a catalog for. */
+let CATALOG_BACKEND = {};
+
+/** True when a provider's endpoint is user-configurable (no default origin). */
+function needsBaseUrl(catalog, id) {
+  const backend = CATALOG_BACKEND[id];
+  return backend !== undefined && backend.defaultBaseURL === undefined && backend.meta?.keyless !== true;
 }
 
 /**
@@ -121,20 +167,17 @@ export function validateSection(section) {
  * @param {object} composition - the normalized plugin row config.
  * @returns {object} the flat base layer.
  */
-export function projectBase(composition) {
+export const projectBase = (catalog) => (composition) => {
   const section = (id) => composition.providers[id] ?? {};
   return {
     provider: composition.provider ?? "",
     order: (composition.order ?? []).join(", "),
     timeoutMs: composition.timeoutMs,
     emptyResultsFallback: composition.emptyResultsFallback,
-    exaApiKeyEnv: section("exa").apiKeyEnv ?? DEFAULT_KEY_ENVS.exa,
-    tavilyApiKeyEnv: section("tavily").apiKeyEnv ?? DEFAULT_KEY_ENVS.tavily,
-    braveApiKeyEnv: section("brave").apiKeyEnv ?? DEFAULT_KEY_ENVS.brave,
-    searxngBaseUrl: section("searxng").baseURL ?? "",
-    searxngBaseUrlEnv: section("searxng").baseUrlEnv ?? "",
+    ...Object.fromEntries(catalog.keyed.map((id) => [`${id}ApiKeyEnv`, section(id).apiKeyEnv ?? catalog.envOf(id)])),
+    ...Object.fromEntries(catalog.ids.filter((id) => needsBaseUrl(catalog, id)).map((id) => [`${id}BaseUrl`, section(id).baseURL ?? ""])),
   };
-}
+};
 
 /**
  * Fold one resolved settings section over the composition config, producing
@@ -151,7 +194,7 @@ export function projectBase(composition) {
  *   (see {@link projectBase}); pass the same value used at registration.
  * @returns {object} the effective router config.
  */
-export function mergeRuntime(composition, resolved, base) {
+export const mergeRuntime = (catalog) => (composition, resolved, base) => {
   if (resolved === undefined) return composition;
   const chosen = (field) => resolved[field] !== base[field];
   const merged = {
@@ -168,7 +211,7 @@ export function mergeRuntime(composition, resolved, base) {
   const orderChosen = chosen("order") && resolved.order.trim() !== "";
   const providerChosen = chosen("provider");
   if (orderChosen) {
-    merged.order = parseOrderString(resolved.order);
+    merged.order = parseOrderString(resolved.order, catalog.ids);
   } else if (providerChosen) {
     if (resolved.provider !== "") merged.provider = resolved.provider;
   } else if (composition.provider !== undefined) {
@@ -180,18 +223,18 @@ export function mergeRuntime(composition, resolved, base) {
     merged.providers[id] ??= {};
     return merged.providers[id];
   };
-  // A key stored in the settings document is the strongest key source: it
-  // lands as the section's literal `apiKey`, which `arm()` resolves before
-  // the credential reference — so it overrides both the managed credential
-  // store and the ambient environment. Unsetting the field removes the
-  // override and falls back to them.
-  for (const [field, id] of Object.entries({ exaApiKey: "exa", tavilyApiKey: "tavily", braveApiKey: "brave" })) {
+  // Stored keys are the strongest key source: they land as the section's
+  // literal `apiKey`, which `arm()` resolves before the credential
+  // reference — overriding both the managed store and the environment.
+  for (const id of catalog.keyed) {
+    const field = `${id}ApiKey`;
     if (chosen(field)) section(id).apiKey = resolved[field] === undefined ? undefined : resolved[field];
+    const envField = `${id}ApiKeyEnv`;
+    if (chosen(envField)) section(id).apiKeyEnv = resolved[envField];
   }
-  if (chosen("exaApiKeyEnv")) section("exa").apiKeyEnv = resolved.exaApiKeyEnv;
-  if (chosen("tavilyApiKeyEnv")) section("tavily").apiKeyEnv = resolved.tavilyApiKeyEnv;
-  if (chosen("braveApiKeyEnv")) section("brave").apiKeyEnv = resolved.braveApiKeyEnv;
-  if (chosen("searxngBaseUrl")) section("searxng").baseURL = resolved.searxngBaseUrl === "" ? undefined : resolved.searxngBaseUrl;
-  if (chosen("searxngBaseUrlEnv")) section("searxng").baseUrlEnv = resolved.searxngBaseUrlEnv === "" ? undefined : resolved.searxngBaseUrlEnv;
+  for (const id of catalog.ids.filter((candidate) => needsBaseUrl(catalog, candidate))) {
+    const field = `${id}BaseUrl`;
+    if (chosen(field)) section(id).baseURL = resolved[field] === "" ? undefined : resolved[field];
+  }
   return merged;
-}
+};

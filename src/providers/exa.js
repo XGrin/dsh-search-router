@@ -10,11 +10,12 @@
  */
 import { httpJSON, normalizeSources, clampCount, joinURL } from "../lib.js";
 
-/** The Exa backend descriptor (see src/router.js for the backend contract). */
-export const exa = {
+/** The exa provider descriptor (id from its file name). */
+export default {
   id: "exa",
   defaultApiKeyEnv: "EXA_API_KEY",
   defaultBaseURL: "https://api.exa.ai",
+  meta: { label: "Exa", sort: 1 },
 
   async search(request, armed, options) {
     const body = {

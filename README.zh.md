@@ -18,11 +18,15 @@ DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Br
 | **Exa** | `EXA_API_KEY` | `https://api.exa.ai` |
 | **Tavily** | `TAVILY_API_KEY` | `https://api.tavily.com` |
 | **Brave** | `BRAVE_SEARCH_API_KEY` | `https://api.search.brave.com` |
+| **Perplexity** | `PPLX_API_KEY` | `https://api.perplexity.ai` |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1` |
 | **SearXNG** | 无（自托管） | `SEARXNG_BASE_URL` |
+| **DuckDuckGo** | 无 | — |
 
 SearXNG 让本路由器可以完全自托管——不依赖任何商业 API。实例需开启
-`json` 输出格式（其 `settings.yml` 中的 `search.formats`）。三个商业提供方的
-端点均可按提供方覆盖（见下方完整 schema）。
+`json` 输出格式（其 `settings.yml` 中的 `search.formats`）。DuckDuckGo 无需
+密钥，因此零配置的部署也能直接提供网页搜索。各提供方端点（及
+Perplexity/DeepSeek 的模型）均可按提供方覆盖（见下方完整 schema）。
 
 ## 安装
 
@@ -46,7 +50,7 @@ dsh-search-router`）即恢复原始组合。
 
 两种方式，控制同一组开关——GUI 逐字段优先，GUI 里重置则回落到组合层的值。
 零配置时，路由器自动探测所有能拿到密钥或端点的提供方，按固定顺序尝试：
-exa → tavily → brave → searxng。
+exa → tavily → brave → perplexity → deepseek → searxng → duckduckgo。
 
 ### 在应用里
 
@@ -90,10 +94,13 @@ profile 自己的补丁层——`$DSH_HOME/profiles/web/cordis.patch.yml`（不�
     timeoutMs: 10000               # 单提供方超时（默认 10000）
     emptyResultsFallback: true     # 零结果视为失败（默认 true）
     providers:
-      exa:    { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: … }
-      tavily: { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: … }
-      brave:  { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: … }
-      searxng: { baseUrl: …, baseUrlEnv: SEARXNG_BASE_URL }
+      exa:        { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: … }
+      tavily:     { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: … }
+      brave:      { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: … }
+      perplexity: { apiKey: …, apiKeyEnv: PPLX_API_KEY, baseURL: …, model: sonar }
+      deepseek:   { apiKey: …, apiKeyEnv: DEEPSEEK_API_KEY, baseURL: …, model: deepseek-v4-flash }
+      searxng:    { baseUrl: …, baseUrlEnv: SEARXNG_BASE_URL }
+      duckduckgo: { baseURL: … }
 ```
 
 会提交的文件里请优先用 `apiKeyEnv`，而非明文 `apiKey`。

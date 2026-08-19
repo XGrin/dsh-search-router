@@ -82,7 +82,26 @@ export function isCallerAborted(error) {
  * @param {{ signal?: AbortSignal, timeoutMs: number }} options - cancellation and timeout budget.
  * @returns {Promise<any>} the parsed JSON body.
  */
-export async function httpJSON(url, init, { signal, timeoutMs }) {
+export async function httpJSON(url, init, options) {
+  const text = await httpText(url, init, options);
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`unparseable JSON response: ${brief(error)}`);
+  }
+}
+
+/**
+ * Fetch one URL and return its body as text, with the same failure
+ * classification as {@link httpJSON} — used by HTML-scraping backends
+ * (DuckDuckGo), which must fail like any other provider.
+ *
+ * @param {string} url - the request URL.
+ * @param {RequestInit} init - fetch options; the abort signal is attached here.
+ * @param {{ signal?: AbortSignal, timeoutMs: number }} options - cancellation and timeout budget.
+ * @returns {Promise<string>} the response body.
+ */
+export async function httpText(url, init, { signal, timeoutMs }) {
   const link = linkedSignal(signal, timeoutMs);
   let response;
   try {
@@ -95,11 +114,7 @@ export async function httpJSON(url, init, { signal, timeoutMs }) {
     link.cleanup();
   }
   if (!response.ok) throw new Error(`HTTP ${response.status}${await errorDetail(response)}`);
-  try {
-    return await response.json();
-  } catch (error) {
-    throw new Error(`unparseable JSON response: ${brief(error)}`);
-  }
+  return response.text();
 }
 
 /**
@@ -150,7 +165,7 @@ export function toSource(item) {
   if (title !== undefined) source.title = title;
   const snippet = nonEmpty(item.snippet) ?? nonEmpty(item.text) ?? nonEmpty(item.content) ?? nonEmpty(item.description);
   if (snippet !== undefined) source.snippet = truncate(stripTags(snippet), MAX_SNIPPET_CHARS);
-  const publishedAt = dateField(item.publishedAt ?? item.publishedDate ?? item.published_date ?? item.page_age ?? item.age);
+  const publishedAt = dateField(item.publishedAt ?? item.publishedDate ?? item.published_date ?? item.page_age ?? item.date ?? item.age);
   if (publishedAt !== undefined) source.publishedAt = publishedAt;
   return source;
 }

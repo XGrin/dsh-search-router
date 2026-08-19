@@ -25,14 +25,44 @@
  * empty result lists. When every backend yields an empty-but-successful
  * response, the (truthful) empty result is returned instead of an error.
  */
+import { readdirSync } from "node:fs";
 import { DEFAULT_TIMEOUT_MS, callerAborted, isCallerAborted } from "./lib.js";
-import { exa } from "./providers/exa.js";
-import { tavily } from "./providers/tavily.js";
-import { brave } from "./providers/brave.js";
-import { searxng } from "./providers/searxng.js";
+import { loadProvider } from "./providers/__registry.js";
+/**
+ * The backends this router knows, discovered from src/providers/*.js: each
+ * file's default export is one provider descriptor (see below) and its file
+ * name is its id, so ADDING A PROVIDER IS DROPPING IN ONE FILE — nothing
+ * else changes. Order is by file name for stability; a provider's `meta`
+ * (name, kind of credential, endpoint field, sort hint) drives the settings
+ * schema and the settings card, so neither carries a provider list.
+ *
+ * A descriptor looks like:
+ *   export default {
+ *     id, defaultApiKeyEnv?, defaultBaseURL?, defaultModel?,
+ *     meta: { label, keyless?, baseUrlEnv?, baseUrlLabel?, envHint? },
+ *     async search(request, armed, options) { … }   // throw = failed
+ *   }
+ */
+export const BACKENDS = discoverBackends();
 
-/** The backends this router knows, in canonical auto-detection order. */
-const BACKENDS = { exa, tavily, brave, searxng };
+/** Load every provider module in src/providers and index it by id. */
+function discoverBackends() {
+  const backends = {};
+  for (const file of readdirSync(new URL("./providers/", import.meta.url)).filter((name) => name.endsWith(".js") && !name.startsWith("_")).sort()) {
+    const id = file.slice(0, -3);
+    backends[id] = loadProviderSync(id);
+  }
+  return backends;
+}
+
+/** Load one provider module, validating its shape loudly. */
+function loadProviderSync(id) {
+  const backend = loadProvider(id);
+  if (backend === undefined || typeof backend !== "object" || backend.id !== id) {
+    throw new Error(`search-router: src/providers/${id}.js must export a provider whose id is "${id}"`);
+  }
+  return backend;
+}
 
 /** The id the router registers under in the DSH web seam. */
 export const SEARCH_ROUTER_PROVIDER_ID = "search-router";
@@ -110,7 +140,7 @@ function parseProviderSections(providers) {
     if (typeof section !== "object" || section === null || Array.isArray(section)) {
       throw new Error(`search-router: providers.${id} must be an object`);
     }
-    const { apiKey, apiKeyEnv, baseURL, baseUrl, baseUrlEnv, ...unknown } = section;
+    const { apiKey, apiKeyEnv, baseURL, baseUrl, baseUrlEnv, model, ...unknown } = section;
     for (const key of Object.keys(unknown)) {
       throw new Error(`search-router: unknown key "${key}" in providers.${id}`);
     }
@@ -119,6 +149,7 @@ function parseProviderSections(providers) {
       apiKeyEnv: optionalString(apiKeyEnv, `providers.${id}.apiKeyEnv`),
       baseURL: normalizeOptionalURL(baseURL ?? baseUrl, `providers.${id}.baseURL`),
       baseUrlEnv: optionalString(baseUrlEnv, `providers.${id}.baseUrlEnv`),
+      ...(optionalString(model, `providers.${id}.model`) !== undefined ? { model: optionalString(model, `providers.${id}.model`) } : {}),
     };
   }
   return parsed;
@@ -222,7 +253,11 @@ export function createRouterProvider(ctx, resolveConfig) {
     const apiKey = keyed ? section.apiKey ?? await resolveSecret(section.apiKeyEnv ?? backend.defaultApiKeyEnv) : undefined;
     const baseURL = section.baseURL
       ?? (keyed ? undefined : ambient(section.baseUrlEnv ?? "SEARXNG_BASE_URL"));
-    return { apiKey, baseURL: baseURL ?? backend.defaultBaseURL };
+    return {
+      apiKey,
+      baseURL: baseURL ?? backend.defaultBaseURL,
+      ...(section.model !== undefined ? { model: section.model } : {}),
+    };
   };
 
   return {
@@ -238,7 +273,7 @@ export function createRouterProvider(ctx, resolveConfig) {
       if (ids_.length === 0) {
         throw new Error(
           "search-router: no search provider is configured — set provider/order in the search-router config, "
-          + "or export EXA_API_KEY / TAVILY_API_KEY / BRAVE_SEARCH_API_KEY / SEARXNG_BASE_URL",
+          + "or export EXA_API_KEY / TAVILY_API_KEY / BRAVE_SEARCH_API_KEY / PPLX_API_KEY / DEEPSEEK_API_KEY / SEARXNG_BASE_URL",
         );
       }
       const failures = [];
