@@ -27,9 +27,15 @@ SearXNG 让本路由器可以完全自托管——不依赖任何商业 API。�
 ## 安装
 
 ```bash
-dsh plugin --profile web add link:/path/to/dsh-search-router   # 本地目录
-dsh plugin --profile web add dsh-search-router                 # 或发布后
+dsh plugin --profile web add github:XGrin/dsh-search-router
 dsh web
+```
+
+或克隆到本地后以链接方式安装（开发时）：
+
+```bash
+git clone https://github.com/XGrin/dsh-search-router.git
+dsh plugin --profile web add link:/path/to/dsh-search-router
 ```
 
 组合补丁会把 web seam 指向本路由器、停用内置的 DeepSeek 搜索，并在 web

@@ -29,9 +29,15 @@ per provider (see the full schema below).
 ## Install
 
 ```bash
-dsh plugin --profile web add link:/path/to/dsh-search-router   # local checkout
-dsh plugin --profile web add dsh-search-router                 # or, once published
+dsh plugin --profile web add github:XGrin/dsh-search-router
 dsh web
+```
+
+Or clone and link locally (for development):
+
+```bash
+git clone https://github.com/XGrin/dsh-search-router.git
+dsh plugin --profile web add link:/path/to/dsh-search-router
 ```
 
 The composition patch points the web seam at the router, disables the built-in
