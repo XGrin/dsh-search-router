@@ -17,6 +17,7 @@ export default {
   id: "perplexity",
   defaultApiKeyEnv: "PPLX_API_KEY",
   defaultBaseURL: "https://api.perplexity.ai",
+  defaultModel: DEFAULT_MODEL,
   meta: { label: "Perplexity", sort: 4 },
 
   async search(request, armed, options) {

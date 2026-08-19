@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 /**
  * Integration test: dsh-search-router against the REAL @deepseek-ai/dsh-web
- * seam, with local mock provider endpoints. No network, no real API keys.
+ * seam, with local mock provider endpoints. No network, no real API keys —
+ * requests to a provider's shipped default origin are rewritten to the local
+ * mock server by a wrapped fetch.
  *
- *   node test/integration.mjs <dir-containing-@deepseek-ai>
+ *   node test/integration.mjs [dir-containing-@deepseek-ai]
  *
- * The directory must contain `@deepseek-ai/cordis` and `@deepseek-ai/dsh-web`
- * (any DSH installation's node_modules, e.g. an npx cache). Cases map to the
- * acceptance matrix: single provider, fallback on 429/timeout, all-fail
- * aggregation, empty-results policy, caller cancellation, auto-detection,
- * seam-level truncation.
+ * Defaults to this package's own node_modules (`npm install` installs the
+ * devDependencies), or pass any DSH installation's node_modules (e.g. an npx
+ * cache) / set DSH_MODULES. Cases map to the acceptance matrix: single
+ * provider, fallback on 429/timeout, all-fail aggregation, empty-results
+ * policy, caller cancellation, auto-detection (zero-config, canonical order,
+ * env isolation), settings layering, seam-level truncation.
  */
 import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -20,7 +23,7 @@ import { tmpdir } from "node:os";
 
 /* ------------------------------------------------------------------ setup */
 
-const modulesDir = resolve(process.argv[2] ?? process.env.DSH_MODULES ?? ".");
+const modulesDir = resolve(process.argv[2] ?? process.env.DSH_MODULES ?? "node_modules");
 const { Context } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/cordis/lib/index.js")).href);
 const { default: WebRuntime } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-web/lib/index.js")).href);
 const { default: FileSettingsProvider } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-settings-file/lib/index.js")).href);
@@ -189,6 +192,23 @@ const providersBase = (over = {}) => ({
   duckduckgo: { baseURL: `${base}/duckduckgo` },
   ...over,
 });
+
+/**
+ * Point a provider's shipped default origin at the local mock server: the
+ * code under test still resolves its real defaultBaseURL; only the socket
+ * changes, so default-endpoint behavior is testable without network.
+ */
+const NO_KEY_ENV = {
+  EXA_API_KEY: undefined, TAVILY_API_KEY: undefined, BRAVE_SEARCH_API_KEY: undefined,
+  PPLX_API_KEY: undefined, DEEPSEEK_API_KEY: undefined, SEARXNG_BASE_URL: undefined,
+};
+const redirectDefaultOrigin = (origin, path) => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => realFetch(String(input).replace(origin, path), init);
+  return () => {
+    globalThis.fetch = realFetch;
+  };
+};
 
 /* ------------------------------------------------------------------ cases */
 
@@ -366,19 +386,59 @@ console.log("case 8: auto-detection from ambient env + available()");
   restore();
 }
 
-console.log("case 9: nothing configured — DuckDuckGo keeps the chain usable");
+console.log("case 9: zero-config — keyless DuckDuckGo serves with nothing set anywhere");
 {
   resetBehavior();
-  const { ctx, restore } = await boot(
-    { timeoutMs: 2000, providers: { duckduckgo: { baseURL: `${base}/duckduckgo` } } },
-    { EXA_API_KEY: undefined, TAVILY_API_KEY: undefined, BRAVE_SEARCH_API_KEY: undefined, SEARXNG_BASE_URL: undefined },
-  );
-  const provider = [...ctx.web.searchProviders.values()].find((p) => p.id === "search-router");
-  check("available() true via keyless DuckDuckGo", provider?.available() === true);
-  const result = await ctx.web.search({ query: "void", maxResults: 5 });
-  check("zero-config search served by DuckDuckGo", result.sources.length === 2 && result.sources[0]?.url === "https://example.com/g1", result.sources);
+  const unredirect = redirectDefaultOrigin(/^https:\/\/html\.duckduckgo\.com/u, `${base}/duckduckgo`);
+  let ctx;
+  let restore;
+  try {
+    ({ ctx, restore } = await boot({ timeoutMs: 2000 }, NO_KEY_ENV));
+    const provider = [...ctx.web.searchProviders.values()].find((p) => p.id === "search-router");
+    check("seam gate open with zero configuration", provider?.available() === true);
+    const result = await ctx.web.search({ query: "void", maxResults: 5 });
+    check("zero-config search served by DuckDuckGo's default endpoint", result.sources.length === 2 && result.sources[0]?.url === "https://example.com/g1", result.sources);
+    check("default DDG origin was used (rewritten to the mock)", seen.duckduckgo.at(-1)?.url.startsWith("/duckduckgo/html"), seen.duckduckgo.at(-1));
+  } finally {
+    unredirect();
+    await ctx?.cleanup?.() ?? await ctx?.dispose?.();
+    restore?.();
+  }
+}
+
+console.log("case 8b: auto-chain follows meta.sort, not file-name order");
+{
+  resetBehavior();
+  behavior.exa = { status: 429, body: {} };
+  const { ctx, restore } = await boot({
+    timeoutMs: 2000,
+    providers: { exa: { baseURL: `${base}/exa` }, deepseek: { baseURL: `${base}/deepseek` }, searxng: { baseUrl: `${base}/searxng` } },
+  }, { ...NO_KEY_ENV, EXA_API_KEY: "ambient-exa-key", DEEPSEEK_API_KEY: "ambient-deepseek-key" });
+  const result = await ctx.web.search({ query: "ordering", maxResults: 5 });
+  eq("exa (meta.sort 1) leads, deepseek (sort 5) answers after its 429", result.sources.map((s) => s.url), ["https://example.com/d1", "https://example.com/d2"]);
+  check("exa was tried first despite 'deepseek' sorting first by file name", seen.exa.length >= 1, seen.exa.at(-1));
   await ctx.cleanup?.() ?? await ctx.dispose?.();
   restore();
+}
+
+console.log("case 8c: SEARXNG_BASE_URL arms SearXNG only — DuckDuckGo keeps its own endpoint");
+{
+  resetBehavior();
+  behavior.searxng = { status: 500, body: {} };
+  const unredirect = redirectDefaultOrigin(/^https:\/\/html\.duckduckgo\.com/u, `${base}/duckduckgo`);
+  let ctx;
+  let restore;
+  try {
+    ({ ctx, restore } = await boot({ timeoutMs: 2000 }, { ...NO_KEY_ENV, SEARXNG_BASE_URL: `${base}/searxng` }));
+    const result = await ctx.web.search({ query: "isolation", maxResults: 5 });
+    check("searxng was armed by its own meta.baseUrlEnv", seen.searxng.length >= 1, seen.searxng.at(-1));
+    eq("duckduckgo answered after searxng failed", result.sources.map((s) => s.url), ["https://example.com/g1", "https://example.com/g2"]);
+    check("duckduckgo hit its own origin, not the SearXNG endpoint", seen.duckduckgo.at(-1)?.url.startsWith("/duckduckgo/html"), seen.duckduckgo.at(-1));
+  } finally {
+    unredirect();
+    await ctx?.cleanup?.() ?? await ctx?.dispose?.();
+    restore?.();
+  }
 }
 
 console.log("case 10: bad config fails loudly at load");
@@ -397,6 +457,21 @@ console.log("case 10: bad config fails loudly at load");
     error = thrown;
   }
   check("provider XOR order enforced", /not both/.test(String(error)), String(error));
+  error = undefined;
+  try {
+    routerPlugin.apply({ web: { registerSearchProvider() {} }, logger: undefined }, { providers: { exa: { model: "gpt-imagine" } } });
+  } catch (thrown) {
+    error = thrown;
+  }
+  check("model rejected for a provider without defaultModel", /providers\.exa\.model is not configurable/.test(String(error)), String(error));
+  let accepted = true;
+  try {
+    routerPlugin.apply({ web: { registerSearchProvider() {} }, inject: () => {}, logger: undefined }, { providers: { perplexity: { model: "sonar-pro" } } });
+  } catch (thrown) {
+    accepted = false;
+    console.log(`      (threw: ${String(thrown)})`);
+  }
+  check("model accepted where the descriptor declares defaultModel", accepted);
 }
 
 console.log("case 11: settings section is served for the Plugins page");
@@ -417,6 +492,8 @@ console.log("case 11: settings section is served for the Plugins page");
       provider: "exa", order: "", timeoutMs: 2000, emptyResultsFallback: true,
       exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
       perplexityApiKeyEnv: "PPLX_API_KEY", deepseekApiKeyEnv: "DEEPSEEK_API_KEY",
+      exaKeyPreset: true, tavilyKeyPreset: true, braveKeyPreset: true,
+      perplexityKeyPreset: true, deepseekKeyPreset: true,
       searxngBaseUrl: `${base}/searxng`,
     };
     eq("base projects the composition", view?.base, expectedSection);

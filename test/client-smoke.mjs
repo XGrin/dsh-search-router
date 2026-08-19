@@ -37,12 +37,22 @@ globalThis.__ModuleLoader__ = {
 await import(pathToFileURL(resolve("src/client/client.js")).href);
 check("factory registered on window.__ModuleLoader__", record?.id === "dsh-search-router", record?.id);
 
-/** Minimal React stand-in: createElement returns plain descriptors. */
+/**
+ * Minimal React stand-in: createElement returns plain descriptors, and
+ * useState reads from a per-render queue so tests can drive the card's
+ * local UI state (open, editing, adding) through the same call order the
+ * component uses.
+ */
+const reactState = { queue: [], index: 0 };
 const React = {
   createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
   Fragment: Symbol.for("react.fragment"),
   useEffect: () => {},
-  useState: (initial) => [initial, () => {}],
+  useState: (initial) => {
+    const slot = reactState.index;
+    reactState.index += 1;
+    return [slot < reactState.queue.length ? reactState.queue[slot] : initial, () => {}];
+  },
 };
 const exports = record.factory((id) => {
   if (id === "react") return React;
@@ -62,25 +72,23 @@ const scopeWrites = [];
 const credentialWrites = [];
 let credentialView = {};
 
-/** The serialized schema shape the browser actually receives (schemastery toJSON refs flattened). */
-const SCHEMA = { dict: Object.fromEntries([
-  ["provider", { type: "union", meta: { default: "" } }],
-  ["order", { type: "string", meta: { default: "" } }],
-  ["timeoutMs", { type: "number", meta: { default: 10000 } }],
-  ["emptyResultsFallback", { type: "boolean", meta: { default: true } }],
-  ...["exa", "tavily", "brave", "perplexity", "deepseek"].flatMap((id) => [
-    [`${id}ApiKey`, { type: "string", meta: { role: "secret" } }],
-    [`${id}ApiKeyEnv`, { type: "string", meta: { role: "credential-ref", default: { exa: "EXA_API_KEY", tavily: "TAVILY_API_KEY", brave: "BRAVE_SEARCH_API_KEY", perplexity: "PPLX_API_KEY", deepseek: "DEEPSEEK_API_KEY" }[id] } }],
-  ]),
-  ["searxngBaseUrl", { type: "string", meta: { default: "" } }],
-  ...[["exa", "Exa"], ["tavily", "Tavily"], ["brave", "Brave"], ["perplexity", "Perplexity"], ["deepseek", "DeepSeek"], ["searxng", "SearXNG"], ["duckduckgo", "DuckDuckGo"]].map(([id, label]) => [`${id}Provider`, { type: "const", meta: { providerLabel: label } }]),
-]) };
+/**
+ * The serialized schema envelope the browser actually receives through
+ * `settings.describe` — the REAL `settingsConfig(...).toJSON()` from the
+ * host half, so the stub cannot drift from what the wire carries
+ * (schemastery's reffed form: dict values are uid pointers into `refs`).
+ * The scope snapshot itself carries NO schema (see SettingsScopeSnapshot),
+ * so the card must parse this envelope.
+ */
+const { BACKENDS } = await import(pathToFileURL(resolve("src/router.js")).href);
+const { providerCatalog, settingsConfig } = await import(pathToFileURL(resolve("src/settings.js")).href);
+const SCHEMA_ENVELOPE = settingsConfig(providerCatalog(BACKENDS)).toJSON();
 
-const BASE = {
+const baseLayer = {
   provider: "", order: "", timeoutMs: 10000, emptyResultsFallback: true,
   exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
   perplexityApiKeyEnv: "PPLX_API_KEY", deepseekApiKeyEnv: "DEEPSEEK_API_KEY",
-  searxngBaseUrl: "", searxngBaseUrlEnv: "",
+  searxngBaseUrl: "",
 };
 const userLayer = {};
 let scopeListener = () => {};
@@ -89,10 +97,9 @@ const scope = {
     status: "ready",
     writable: true,
     revision: 1,
-    schema: SCHEMA,
-    base: BASE,
+    base: baseLayer,
     user: Object.keys(userLayer).length > 0 ? { ...userLayer } : void 0,
-    value: { ...BASE, ...userLayer },
+    value: { ...baseLayer, ...userLayer },
   }),
   subscribe: (listener) => {
     scopeListener = listener;
@@ -131,7 +138,8 @@ const api = {
             ns: "search-router",
             applies: "live",
             revision: 1,
-            value: { ...BASE, ...userLayer },
+            schema: SCHEMA_ENVELOPE,
+            value: { ...baseLayer, ...userLayer },
             secrets: ["exaApiKey", "tavilyApiKey", "braveApiKey", "perplexityApiKey", "deepseekApiKey"].map((field) => ({ path: [field], set: Object.hasOwn(userLayer, field) })),
           }],
         },
@@ -176,6 +184,8 @@ const ctx = {
 };
 
 exports.apply(ctx);
+/* the wire schema arrives asynchronously — let the describe read settle */
+await flush();
 
 /* -------------------------------------------------------------- assertions */
 
@@ -311,16 +321,129 @@ check("perplexity stored key auto-detected with PPLX ref", state.keys.perplexity
 await actions.clearKey("perplexity");
 await flush();
 
-/* render smoke: the component builds a descriptor tree without throwing */
-try {
-  const tree = card.component({
-    t: (key) => key,
-    useSearchRouterCard: () => state,
-    actions,
+/* base-layer preset flag: a key set in the profile config counts as configured */
+baseLayer.exaKeyPreset = true;
+scopeListener();
+state = face.hooks.searchRouterCard.getSnapshot();
+check("composition preset flag marks the provider configured", state.keys.exa.preset === true && state.chain.includes("exa") === true, { chain: state.chain, exa: state.keys.exa });
+delete baseLayer.exaKeyPreset;
+scopeListener();
+
+/* render smoke: walk the descriptor tree — labels must actually appear */
+const walkTree = (node, visit) => {
+  if (Array.isArray(node)) {
+    for (const child of node) walkTree(child, visit);
+    return;
+  }
+  if (node !== null && typeof node === "object") {
+    visit(node);
+    // Resolve component references (ProviderRow, AddProviderCard, icons…):
+    // their content lives in the descriptor the function returns.
+    if (typeof node.type === "function") {
+      walkTree(node.type(node.props), visit);
+      return;
+    }
+    for (const child of node.children ?? []) walkTree(child, visit);
+  }
+};
+const nodesWith = (root, className) => {
+  const found = [];
+  walkTree(root, (node) => {
+    if (node.props?.className === className) found.push(node);
   });
+  return found;
+};
+const renderProps = {
+  t: (key, params) => (params === undefined ? key : `${key} ${Object.values(params).join(" ")}`),
+  useSearchRouterCard: () => state,
+  actions,
+};
+const renderCard = (uiState) => {
+  reactState.queue = uiState;
+  reactState.index = 0;
+  return card.component(renderProps);
+};
+try {
+  state = face.hooks.searchRouterCard.getSnapshot();
+  const tree = renderCard([true]);
   check("component renders to a descriptor tree", tree?.type === "li" && tree?.props?.className === "dsr-card");
+  const rows = nodesWith(tree, "dsr-rowname");
+  check(
+    "every chain row renders its provider label",
+    rows.length === state.chain.length && rows.every((row) => typeof row.children[0] === "string" && row.children[0] === state.labels[state.chain[rows.indexOf(row)]]),
+    { chain: state.chain, rowNames: rows.map((row) => row.children[0]) },
+  );
+  const grips = nodesWith(tree, "dsr-grip");
+  check(
+    "grip aria-labels carry the provider name, never undefined",
+    grips.length === state.chain.length && grips.every((grip) => String(grip.props["aria-label"]).includes(state.labels[state.chain[grips.indexOf(grip)]]) && !String(grip.props["aria-label"]).includes("undefined")),
+    grips.map((grip) => grip.props["aria-label"]),
+  );
+  const addTree = renderCard([true, void 0, true]);
+  const select = nodesWith(addTree, "dsr-select")[0];
+  const options = [];
+  walkTree(select, (node) => {
+    if (node.type === "option" && node.props?.value !== "" && node.props?.value !== undefined) options.push(node);
+  });
+  check(
+    "add-provider dropdown shows labels, not raw ids",
+    select !== undefined && options.length === state.addable.length && options.every((option) => option.children[0] === state.labels[option.props.value]),
+    options.map((option) => [option.props.value, option.children[0]]),
+  );
 } catch (error) {
   check("component renders to a descriptor tree", false, String(error));
+}
+
+/* first-frame race regression: a fresh bind reads credential state through
+   the wire describe alone — NO scope event fires between bind and read, so
+   an env-backed provider must already appear in the first snapshot */
+{
+  credentialView = { TAVILY_API_KEY: { configured: true, writable: true } };
+  let credentialReads = 0;
+  const api2 = {
+    credentials: {
+      describe: async ({ refs }) => {
+        credentialReads += 1;
+        return { result: { ok: true, value: { credentials: Object.fromEntries(refs.map((ref) => [ref, credentialView[ref] ?? { configured: false, writable: true }])) } } };
+      },
+    },
+    settings: {
+      describe: async () => ({
+        result: {
+          ok: true,
+          value: {
+            writable: true,
+            namespaces: [{
+              ns: "search-router",
+              applies: "live",
+              revision: 1,
+              schema: SCHEMA_ENVELOPE,
+              value: { ...baseLayer, ...userLayer },
+              secrets: ["exaApiKey", "tavilyApiKey", "braveApiKey", "perplexityApiKey", "deepseekApiKey"].map((field) => ({ path: [field], set: Object.hasOwn(userLayer, field) })),
+            }],
+          },
+        },
+      }),
+    },
+  };
+  const ctx2 = {
+    get: (name) => (name === "connection" ? { api: api2 } : undefined),
+    effect: (effect) => {
+      const dispose = effect();
+      return () => void dispose?.();
+    },
+    locale: { register: () => () => {} },
+    remote: { $on: () => () => {} },
+    settingsScope: { bind: () => scope },
+    slots: { inject: (slot, factory) => factory(), register: (options) => { slotRegistrations.push({ options }); return () => {}; } },
+  };
+  exports.apply(ctx2);
+  await flush();
+  const fresh = slotRegistrations.at(-1)?.options.inject();
+  const first = fresh.hooks.searchRouterCard.getSnapshot();
+  check("fresh bind shows the env-keyed provider on the FIRST frame", first.chain.includes("tavily") === true, { chain: first.chain });
+  check("credential state was read without any scope event", credentialReads >= 1, credentialReads);
+  credentialView = {};
 }
 
 if (failures === 0) console.log("\nall client-smoke checks passed");

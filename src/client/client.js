@@ -17,9 +17,10 @@
  * field immediately through the settings scope. API keys persist in the
  * settings document as role('secret') fields and override the environment;
  * the value itself is redacted from every wire crossing, so the card learns
- * only whether one is stored (the describe sidecar's set flag). With no
- * explicit order stored, the card shows the auto-detected chain (first
- * provider whose key or endpoint is configured) and a banner explaining it.
+ * only whether one is stored (the describe sidecar's set flag, plus the
+ * base-layer flag that marks a key preset in the profile config). With no
+ * explicit order stored, the card shows the auto-detected chain (every
+ * provider whose key or endpoint resolves) and a banner explaining it.
  */
 window.__ModuleLoader__.load({
 	id: "dsh-search-router",
@@ -42,44 +43,48 @@ window.__ModuleLoader__.load({
 		const TAIL = "__tail__";
 
 		/**
-		 * Derive the provider catalog from the served settings section: the
-		 * schema's own field set names every provider — `<id>ApiKeyEnv`
-		 * marks a keyed provider, `<id>BaseUrl` an endpoint-configurable
-		 * one, `meta.label` its display name (carried in the serialized
-		 * schema). The card therefore knows no provider ids itself; adding a
-		 * provider file changes nothing here.
-		 * @param scope - the bound `search-router` settings scope.
-		 * @returns {{ ids: string[], keyed: string[], labelOf: (id: string) => string, envOf: (id: string) => string }} the catalog.
+		 * The catalog before the wire schema arrives — no providers, no
+		 * keys, nothing usable: the card renders its loading state.
 		 */
-		function catalogOf(scope) {
-			const dict = schemaDict(scope.getSnapshot());
+		const EMPTY_CATALOG = Object.freeze({ ids: [], keyed: [] });
+
+		/**
+		 * Derive the provider catalog from the settings namespace's
+		 * SERIALIZED schema envelope (`settings.describe`'s `schema` field —
+		 * schemastery's `toJSON()` reffed form; the scope snapshot itself
+		 * carries only values). The schema's own field set names every
+		 * provider — an `<id>Provider` marker (carrying `meta.label`)
+		 * declares it, `<id>ApiKeyEnv` marks it keyed — so the card knows no
+		 * provider ids itself and adding a provider file changes nothing
+		 * here.
+		 * @param envelope - the serialized schema envelope (uid + refs).
+		 * @returns {{ ids: string[], keyed: string[], labels: Record<string, string> }} the catalog.
+		 */
+		function catalogFromEnvelope(envelope) {
+			if (envelope === null || typeof envelope !== "object") return EMPTY_CATALOG;
+			const refs = envelope.refs ?? {};
+			/** Dict values are uid pointers (bare numbers or `{uid}` cells). */
+			const deref = (entry) => {
+				if (typeof entry === "number") return refs[entry];
+				if (entry !== null && typeof entry === "object" && entry.uid !== void 0) return refs[entry.uid];
+				return entry;
+			};
+			const root = deref(envelope);
+			const dict = root !== null && typeof root === "object" ? root.dict : void 0;
+			if (dict === null || typeof dict !== "object") return EMPTY_CATALOG;
 			const ids = [];
 			const keyed = [];
 			const labels = {};
-			const envs = {};
-			const fieldOf = (id) => dict[`${id}Provider`];
 			for (const field of Object.keys(dict)) {
 				const marker = /^(\w+)Provider$/.exec(field);
-				if (marker !== null) {
-					ids.push(marker[1]);
-					const meta = fieldOf(marker[1])?.meta;
-					if (meta !== null && typeof meta === "object" && typeof meta.providerLabel === "string") labels[marker[1]] = meta.providerLabel;
-				}
+				if (marker === null) continue;
+				const id = marker[1];
+				ids.push(id);
+				if (dict[`${id}ApiKeyEnv`] !== undefined) keyed.push(id);
+				const meta = deref(dict[field])?.meta;
+				if (meta !== null && typeof meta === "object" && typeof meta.providerLabel === "string") labels[id] = meta.providerLabel;
 			}
-			for (const id of ids) {
-				if (dict[`${id}ApiKeyEnv`] !== undefined) {
-					keyed.push(id);
-					envs[id] = String(scope.getSnapshot().base?.[`${id}ApiKeyEnv`] ?? scope.getSnapshot().value?.[`${id}ApiKeyEnv`] ?? "");
-				}
-			}
-			return { ids, keyed, labelOf: (id) => labels[id] ?? id, envOf: (id) => envs[id] ?? "" };
-		}
-
-		/** Read a serialized schemastery object schema's field table. */
-		function schemaDict(snapshot) {
-			const schema = snapshot?.schema;
-			if (schema === void 0 || typeof schema !== "object") return {};
-			return schema.dict ?? {};
+			return { ids, keyed, labels };
 		}
 
 		//#endregion
@@ -201,11 +206,8 @@ window.__ModuleLoader__.load({
 				this.status = void 0;
 				this.credentials = {};
 				this.stored = {};
-				this.catalog = catalogOf(scope);
-				for (const id of this.catalog.keyed) {
-					this.credentials[id] = { ref: this.catalog.envOf(id), configured: false, writable: true };
-					this.stored[id] = false;
-				}
+				/** The provider catalog, derived from the wire schema envelope. */
+				this.catalog = EMPTY_CATALOG;
 				scope.subscribe(() => {
 					this.readState();
 					this.publish();
@@ -248,6 +250,11 @@ window.__ModuleLoader__.load({
 				return this.stored[id] === true;
 			}
 
+			/** True when the composition carries a literal key (base-layer flag). */
+			presetKey(id) {
+				return this.snapshotOf().base?.[`${id}KeyPreset`] === true;
+			}
+
 			/** True when a base-URL provider's endpoint resolves from the section. */
 			baseUrlConfigured(id) {
 				return String(this.sectionValue(`${id}BaseUrl`) ?? "").trim() !== "";
@@ -264,11 +271,18 @@ window.__ModuleLoader__.load({
 				return !this.catalog.keyed.includes(id) && !this.hasBaseUrlField(id);
 			}
 
-			/** The provider the Host would currently reach first. */
+			/** The credential reference a keyed provider currently resolves. */
+			envOf(id) {
+				const field = `${id}ApiKeyEnv`;
+				return String(this.snapshotOf().base?.[field] ?? this.snapshotOf().value?.[field] ?? "");
+			}
+
+			/** True when the Host's auto-detection would include this provider. */
 			usable(id) {
+				if (this.catalog.ids.length === 0) return false;
 				if (this.keyless(id)) return true;
 				if (this.hasBaseUrlField(id)) return this.baseUrlConfigured(id);
-				return this.keyConfigured(id) || this.keyStored(id);
+				return this.keyConfigured(id) || this.keyStored(id) || this.presetKey(id);
 			}
 
 			/** The currently effective endpoint of a base-URL provider. */
@@ -394,16 +408,53 @@ window.__ModuleLoader__.load({
 
 			/* ---------------------------------------------------- credential state */
 
-			/** Read credential availability (env/store) and stored-key flags. */
+			/** Read credential availability (env/store) and the wire's own view. */
 			async readState() {
 				this.readCredentialAvailability();
-				this.readStoredKeys();
+				this.readSection();
+			}
+
+			/**
+			 * One `settings.describe` read: the namespace's serialized schema
+			 * envelope yields the provider catalog, its secret sidecar the
+			 * stored-key flags — one wire call for both.
+			 */
+			async readSection() {
+				let response;
+				try {
+					response = await this.api.settings.describe({ redactSecrets: true });
+				} catch (_settingsReadFailure) {
+					return;
+				}
+				if (!response.result.ok) return;
+				const view = response.result.value.namespaces.find((candidate) => candidate.ns === NS);
+				if (view === void 0) return;
+				let changed = false;
+				const catalog = catalogFromEnvelope(view.schema);
+				if (catalog.ids.length > 0 && (catalog.ids.join(",") !== this.catalog.ids.join(",") || JSON.stringify(catalog.labels ?? {}) !== JSON.stringify(this.catalog.labels ?? {}))) {
+					this.catalog = catalog;
+					changed = true;
+					// The catalog just arrived (first wire read): credential
+					// availability was skipped while it was empty — read it
+					// now rather than waiting for the next scope event.
+					this.readCredentialAvailability();
+				}
+				const set = new Set((view.secrets ?? []).filter((secret) => secret.set === true).map((secret) => secret.path?.[0]));
+				for (const id of catalog.keyed) {
+					const next = set.has(`${id}ApiKey`);
+					if (next !== this.stored[id]) {
+						this.stored[id] = next;
+						changed = true;
+					}
+				}
+				if (changed) this.publish();
 			}
 
 			/** Ask the credentials domain about each key's reference. */
 			async readCredentialAvailability() {
+				if (this.catalog.keyed.length === 0) return;
 				const keyed = this.catalog.keyed;
-				const refs = keyed.map((id) => this.credentials[id]?.ref ?? this.catalog.envOf(id));
+				const refs = keyed.map((id) => this.envOf(id));
 				let response;
 				try {
 					response = await this.api.credentials.describe({ refs });
@@ -414,32 +465,12 @@ window.__ModuleLoader__.load({
 				const views = response.result.value.credentials;
 				let changed = false;
 				for (const id of keyed) {
-					const view = views[this.credentials[id]?.ref ?? this.catalog.envOf(id)];
-					const next = { ref: this.credentials[id]?.ref ?? this.catalog.envOf(id), configured: view?.configured ?? false, writable: view?.writable ?? true };
-					if (next.configured === this.credentials[id].configured && next.writable === this.credentials[id].writable) continue;
+					const ref = this.envOf(id);
+					const view = views[ref];
+					const next = { ref, configured: view?.configured ?? false, writable: view?.writable ?? true };
+					const prev = this.credentials[id];
+					if (prev !== undefined && prev.ref === next.ref && prev.configured === next.configured && prev.writable === next.writable) continue;
 					this.credentials[id] = next;
-					changed = true;
-				}
-				if (changed) this.publish();
-			}
-
-			/** Read the redacted settings descriptor's secret sidecar. */
-			async readStoredKeys() {
-				let response;
-				try {
-					response = await this.api.settings.describe({ redactSecrets: true });
-				} catch (_settingsReadFailure) {
-					return;
-				}
-				if (!response.result.ok) return;
-				const view = response.result.value.namespaces.find((candidate) => candidate.ns === NS);
-				if (view === void 0) return;
-				const set = new Set((view.secrets ?? []).filter((secret) => secret.set === true).map((secret) => secret.path?.[0]));
-				let changed = false;
-				for (const id of this.catalog.keyed) {
-					const next = set.has(`${id}ApiKey`);
-					if (next === this.stored[id]) continue;
-					this.stored[id] = next;
 					changed = true;
 				}
 				if (changed) this.publish();
@@ -447,7 +478,7 @@ window.__ModuleLoader__.load({
 
 			/** Re-read after the Host reports a change to a watched reference. */
 			refreshCredential(ref) {
-				if (!this.catalog.keyed.some((id) => (this.credentials[id]?.ref ?? this.catalog.envOf(id)) === ref)) return;
+				if (!this.catalog.keyed.some((id) => this.envOf(id) === ref)) return;
 				this.readCredentialAvailability();
 			}
 
@@ -464,9 +495,9 @@ window.__ModuleLoader__.load({
 					status: this.status,
 					explicit: this.explicitOrder(),
 					chain,
-					labels: Object.fromEntries(this.catalog.ids.map((id) => [id, this.catalog.labelOf(id)])),
+					labels: Object.fromEntries(this.catalog.ids.map((id) => [id, this.catalog.labels?.[id] ?? id])),
 					addable: this.catalog.ids.filter((id) => !chain.includes(id)),
-					keys: Object.fromEntries(this.catalog.keyed.map((id) => [id, { ...this.credentials[id], stored: this.stored[id] }])),
+					keys: Object.fromEntries(this.catalog.keyed.map((id) => [id, { ...this.credentials[id], stored: this.stored[id], preset: this.presetKey(id) }])),
 					endpoints: Object.fromEntries(this.catalog.ids.filter((id) => this.hasBaseUrlField(id)).map((id) => [id, {
 						url: String(this.sectionValue(`${id}BaseUrl`) ?? ""),
 						overridden: this.overridden(`${id}BaseUrl`),
@@ -579,6 +610,7 @@ window.__ModuleLoader__.load({
 					state.chain.length === 0 ? h("p", { className: "dsr-empty" }, t("emptyChain")) : h("ul", { className: "dsr-rows" },
 						state.chain.map((id, index) => h(ProviderRow, {
 							key: id, id, rank: index + 1, t, state, disabled,
+							label: state.labels[id] ?? id,
 							primary: index === 0,
 							keyState: props0(state, id).ok ? "ok" : "missing",
 							keyLabel: t(props0(state, id).ok ? "configured" : props0(state, id).kind === "keyless" ? "keyless" : "notConfigured"),
@@ -630,7 +662,7 @@ window.__ModuleLoader__.load({
 						}, h("span", { className: "dsr-taillabel" }, t("dropToEnd"))) : null
 					),
 					state.addable.length > 0 ? (adding ? h(AddProviderCard, {
-						t, addable: state.addable, disabled,
+						t, addable: state.addable, disabled, stateLabels: state.labels,
 						onAdd: (id) => {
 							setAdding(false);
 							if (id !== "") props.actions.addProvider(id);
@@ -662,7 +694,7 @@ window.__ModuleLoader__.load({
 						onChange: (event) => {
 							setPick(event.target.value);
 						}
-					}, [h("option", { value: "", key: "" }, t("addPick")), ...props.addable.map((id) => h("option", { value: id, key: id }, props.stateLabels[id] ?? id))])
+					}, [h("option", { value: "", key: "" }, t("addPick")), ...props.addable.map((id) => h("option", { value: id, key: id }, stateLabels[id] ?? id))])
 				),
 				h("div", { className: "dsr-editoractions" },
 					h("button", { type: "button", className: "dsr-btn", onClick: props.onCancel }, t("cancel")),
@@ -675,7 +707,7 @@ window.__ModuleLoader__.load({
 
 		/** One provider's readiness projection for the row chrome. */
 		function props0(state, id) {
-			if (state.keys[id]?.configured === true || state.keys[id]?.stored === true) return { kind: "key", ok: true };
+			if (state.keys[id]?.configured === true || state.keys[id]?.stored === true || state.keys[id]?.preset === true) return { kind: "key", ok: true };
 			const endpoint = state.endpoints?.[id];
 			if (endpoint !== undefined) return { kind: "endpoint", ok: endpoint.url !== "" };
 			if (state.keys[id] !== undefined) return { kind: "key", ok: false };
@@ -701,7 +733,10 @@ window.__ModuleLoader__.load({
 					event.dataTransfer.dropEffect = "move";
 					props.onDragOver(true);
 				},
-				onDragLeave: () => {
+				onDragLeave: (event) => {
+					// Only clear when the pointer leaves the row itself, not on
+					// the child-element crossings the event also fires for.
+					if (event.currentTarget.contains(event.relatedTarget)) return;
 					props.onDragOver(false);
 				},
 				onDrop: (event) => {
@@ -743,7 +778,7 @@ window.__ModuleLoader__.load({
 			return h("div", { className: "dsr-editor" },
 				h("div", { className: "dsr-editorhead" },
 					h("span", { className: "dsr-editortitle" }, props.state.labels[props.id] ?? props.id),
-					h("span", { className: "dsr-editorsub" }, key.stored === true ? t("storedKey") : key.configured === true ? t("envKey", { ref: key.ref ?? "" }) : t("noKey"))
+					h("span", { className: "dsr-editorsub" }, key.stored === true ? t("storedKey") : key.preset === true ? t("presetKey") : key.configured === true ? t("envKey", { ref: key.ref ?? "" }) : t("noKey"))
 				),
 				h("div", { className: "dsr-field" },
 					h("span", { className: "dsr-fieldlabel" }, t("apiKey")),
@@ -761,8 +796,8 @@ window.__ModuleLoader__.load({
 						props.actions.clearKey(props.id);
 					} }, t("clearKey")) : null,
 					h("button", { type: "button", className: "dsr-btn dsr-btn-confirm", disabled: blocked, onClick: () => {
-						props.actions.saveKey(props.id, trimmed).then(() => {
-							setText("");
+						props.actions.saveKey(props.id, trimmed).then((ok) => {
+							if (ok) setText("");
 						});
 					} }, t("apply"))
 				)
@@ -889,6 +924,7 @@ window.__ModuleLoader__.load({
 			keyEnter: "Enter an API key",
 			keyKeep: "A key is already set — leave blank to keep it",
 			storedKey: "Using the key stored in settings",
+			presetKey: "Using the key set in the profile config",
 			envKey: "Using {ref} from the environment",
 			noKey: "No key set",
 			clearKey: "Clear stored key",
@@ -932,6 +968,7 @@ window.__ModuleLoader__.load({
 			keyEnter: "输入 API Key",
 			keyKeep: "已设置密钥，留空表示保持不变",
 			storedKey: "使用设置中存储的密钥",
+			presetKey: "使用配置文件中设置的密钥",
 			envKey: "使用环境变量 {ref}",
 			noKey: "未设置密钥",
 			clearKey: "清除已存密钥",

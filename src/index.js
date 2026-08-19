@@ -5,10 +5,10 @@
  * It registers exactly one `WebSearchProvider` (id `search-router`) into the
  * web capability seam (`ctx.web`); the model keeps seeing the same native
  * `web_search` tool, and the composition patch beside this package points
- * `web.searchProvider` at the router. Search backends (Exa, Tavily, Brave,
- * SearXNG) are plain HTTP adapters over the global `fetch` — the plugin adds
- * no tools, no MCP servers, and no provider-specific fields to the model
- * surface.
+ * `web.searchProvider` at the router. Search backends — one file each under
+ * src/providers/ — are plain HTTP adapters over the global `fetch`; the
+ * plugin adds no tools, no MCP servers, and no provider-specific fields to
+ * the model surface.
  *
  * Configuration has two layers over one router: the plugin row config in the
  * profile's composition (cordis.patch.yml — the full nested shape), and the

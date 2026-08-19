@@ -25,6 +25,7 @@ export default {
   id: "deepseek",
   defaultApiKeyEnv: "DEEPSEEK_API_KEY",
   defaultBaseURL: DEFAULT_BASE_URL,
+  defaultModel: DEFAULT_MODEL,
   meta: { label: "DeepSeek", sort: 5 },
 
   async search(request, armed, options) {

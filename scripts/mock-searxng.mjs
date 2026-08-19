@@ -4,7 +4,7 @@
  * answering the documented SearXNG JSON shape. For local end-to-end boots
  * without any real search API.
  *
- *   node test/mock-searxng.mjs [port]
+ *   node scripts/mock-searxng.mjs [port]
  */
 import { createServer } from "node:http";
 

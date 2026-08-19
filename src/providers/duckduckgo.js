@@ -51,11 +51,20 @@ function parseSERP(html) {
   }));
 }
 
-/** Unwrap DDG redirect links to the real target; leave direct URLs untouched. */
+/**
+ * Unwrap DDG redirect links to the real target; leave direct URLs
+ * untouched. A malformed `uddg` payload falls back to the wrapped href —
+ * one bad link never poisons the rest of the page.
+ */
 function unwrap(href) {
   const decoded = href.replace(/&amp;/gu, "&");
   const target = /duckduckgo\.com\/l\/\?[^>]*uddg=([^&]+)/iu.exec(decoded);
-  return target === null ? decoded : decodeURIComponent(target[1]);
+  if (target === null) return decoded;
+  try {
+    return decodeURIComponent(target[1]);
+  } catch {
+    return decoded;
+  }
 }
 
 /** Collapse whitespace and drop any markup from a SERP fragment. */

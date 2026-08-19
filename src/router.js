@@ -5,7 +5,7 @@
  *
  * Backend contract (one object per src/providers/*.js):
  *   {
- *     id: string,                       // 'exa' | 'tavily' | 'brave' | 'searxng'
+ *     id: string,                       // one id per file in src/providers/
  *     defaultApiKeyEnv?: string,        // credential ref / env var name
  *     defaultBaseURL?: string,          // API origin (searxng has none — user-supplied)
  *     async search(request, armed, options): Promise<{ sources, content? }>
@@ -18,7 +18,7 @@
  *   - `order: [exa, tavily, searxng]` — sequential fallback chain;
  *   - `provider: exa` — that one backend, no fallback;
  *   - neither — every backend whose credential/endpoint is locally
- *     discoverable, in canonical order (exa, tavily, brave, searxng).
+ *     discoverable, in canonical order (each provider's `meta.sort`).
  *
  * A backend counts as failed on network errors, timeouts, HTTP 401/403/429/
  * 5xx (any non-2xx in fact), unparseable responses — and, by default, on
@@ -32,9 +32,11 @@ import { loadProvider } from "./providers/__registry.js";
  * The backends this router knows, discovered from src/providers/*.js: each
  * file's default export is one provider descriptor (see below) and its file
  * name is its id, so ADDING A PROVIDER IS DROPPING IN ONE FILE — nothing
- * else changes. Order is by file name for stability; a provider's `meta`
- * (name, kind of credential, endpoint field, sort hint) drives the settings
- * schema and the settings card, so neither carries a provider list.
+ * else changes. Canonical order is each provider's `meta.sort` (then id), so
+ * the router's auto-chain, the settings schema, and the settings card all
+ * present one priority order; a provider's `meta` (name, kind of credential,
+ * endpoint field, sort hint) drives the settings schema and the card, so
+ * neither carries a provider list.
  *
  * A descriptor looks like:
  *   export default {
@@ -45,20 +47,24 @@ import { loadProvider } from "./providers/__registry.js";
  */
 export const BACKENDS = discoverBackends();
 
-/** Load every provider module in src/providers and index it by id. */
+/** Load every provider module in src/providers, indexed by id in canonical order. */
 function discoverBackends() {
-  const backends = {};
-  for (const file of readdirSync(new URL("./providers/", import.meta.url)).filter((name) => name.endsWith(".js") && !name.startsWith("_")).sort()) {
+  const entries = [];
+  for (const file of readdirSync(new URL("./providers/", import.meta.url)).filter((name) => name.endsWith(".js") && !name.startsWith("_"))) {
     const id = file.slice(0, -3);
-    backends[id] = loadProviderSync(id);
+    entries.push([id, loadProviderSync(id)]);
   }
-  return backends;
+  entries.sort(([, a], [, b]) => (a.meta?.sort ?? 99) - (b.meta?.sort ?? 99) || a.id.localeCompare(b.id));
+  return Object.fromEntries(entries);
 }
 
 /** Load one provider module, validating its shape loudly. */
 function loadProviderSync(id) {
   const backend = loadProvider(id);
-  if (backend === undefined || typeof backend !== "object" || backend.id !== id) {
+  if (backend === undefined) {
+    throw new Error(`search-router: src/providers/${id}.js is missing from src/providers/__registry.js — run \`npm run providers\` to regenerate the registry`);
+  }
+  if (typeof backend !== "object" || backend.id !== id) {
     throw new Error(`search-router: src/providers/${id}.js must export a provider whose id is "${id}"`);
   }
   return backend;
@@ -76,16 +82,11 @@ const DEFAULT_MAX_RESULTS = 8;
  * no-op. Shape:
  *
  *   {
- *     provider?: 'exa' | 'tavily' | 'brave' | 'searxng',
- *     order?: string[],
+ *     provider?: string,                 // one backend id, no fallback
+ *     order?: string[],                  // fallback chain of backend ids
  *     timeoutMs?: number,                 // per-provider, default 10000
  *     emptyResultsFallback?: boolean,     // default true
- *     providers?: {
- *       exa?:    { apiKey?, apiKeyEnv?, baseURL? },
- *       tavily?: { apiKey?, apiKeyEnv?, baseURL? },
- *       brave?:  { apiKey?, apiKeyEnv?, baseURL? },
- *       searxng: { baseUrl? | baseURL?, baseUrlEnv? },
- *     },
+ *     providers?: { [id]: { apiKey?, apiKeyEnv?, baseURL? | baseUrl?, baseUrlEnv?, model? } },
  *   }
  *
  * @param {unknown} raw - the row config cordis passed to apply().
@@ -144,12 +145,16 @@ function parseProviderSections(providers) {
     for (const key of Object.keys(unknown)) {
       throw new Error(`search-router: unknown key "${key}" in providers.${id}`);
     }
+    const parsedModel = optionalString(model, `providers.${id}.model`);
+    if (parsedModel !== undefined && BACKENDS[id].defaultModel === undefined) {
+      throw new Error(`search-router: providers.${id}.model is not configurable for "${id}"`);
+    }
     parsed[id] = {
       apiKey: optionalString(apiKey, `providers.${id}.apiKey`),
       apiKeyEnv: optionalString(apiKeyEnv, `providers.${id}.apiKeyEnv`),
       baseURL: normalizeOptionalURL(baseURL ?? baseUrl, `providers.${id}.baseURL`),
       baseUrlEnv: optionalString(baseUrlEnv, `providers.${id}.baseUrlEnv`),
-      ...(optionalString(model, `providers.${id}.model`) !== undefined ? { model: optionalString(model, `providers.${id}.model`) } : {}),
+      ...(parsedModel !== undefined ? { model: parsedModel } : {}),
     };
   }
   return parsed;
@@ -191,9 +196,9 @@ function normalizeOptionalURL(value, field) {
  * `apiKeyEnv` doubles as the credential reference, exactly like the shipped
  * web-search-deepseek provider.
  *
- * The provider resolves its config through `resolveConfig()` at every search
- * (and every `available()` call), so settings writes from the Plugins page
- * take effect on the next search with no restart.
+ * The provider resolves its config through `resolveConfig()` at every
+ * search, so settings writes from the Plugins page take effect on the next
+ * search with no restart.
  *
  * @param {object} ctx - the plugin context (`web` is injected).
  * @param {() => object} resolveConfig - returns the currently effective
@@ -223,27 +228,36 @@ export function createRouterProvider(ctx, resolveConfig) {
     return ambient(name);
   };
 
-  /** The backend chain per the CURRENT config (cheap, sync, no network). */
-  const chain = () => {
+  /** The backend chain per the CURRENT config: explicit routing, else auto-detection. */
+  const chain = async () => {
     const config = resolveConfig();
     if (config.order !== undefined) return config.order;
     if (config.provider !== undefined) return [config.provider];
-    return ids().filter((id) => locallyConfigured(id));
+    // Auto-detection resolves each keyed provider's credential through the
+    // same plane arm() uses, so a key held only in the managed credentials
+    // store drives detection exactly like an ambient one — the settings card
+    // (which reads that store through the credentials domain) agrees.
+    const detected = [];
+    for (const id of ids()) {
+      const backend = BACKENDS[id];
+      const section = config.providers[id] ?? {};
+      if (backend.defaultApiKeyEnv === undefined) {
+        if (keylessReady(backend, section)) detected.push(id);
+      } else if (section.apiKey !== undefined || (await resolveSecret(section.apiKeyEnv ?? backend.defaultApiKeyEnv)) !== undefined) {
+        detected.push(id);
+      }
+    }
+    return detected;
   };
 
   /**
-   * Cheap sync usability check for auto-detection and the seam's
-   * `available()`: a literal config key or an ambient env value. Backends
-   * reachable only through the managed credentials store are intentionally
-   * not auto-detected — set `provider`/`order` explicitly for those.
+   * A keyless provider is detectable when its endpoint resolves: an explicit
+   * baseURL, its own `meta.baseUrlEnv` ambient, or its shipped
+   * defaultBaseURL (DuckDuckGo needs nothing at all). A keyed provider that
+   * carries its own defaultBaseURL needs nothing but its key.
    */
-  const locallyConfigured = (id) => {
-    const section = resolveConfig().providers[id] ?? {};
-    if (BACKENDS[id].defaultApiKeyEnv === undefined) {
-      return (section.baseURL ?? ambient(section.baseUrlEnv ?? "SEARXNG_BASE_URL")) !== undefined;
-    }
-    return (section.apiKey ?? ambient(section.apiKeyEnv ?? BACKENDS[id].defaultApiKeyEnv)) !== undefined;
-  };
+  const keylessReady = (backend, section) =>
+    (section.baseURL ?? ambient(section.baseUrlEnv ?? backend.meta?.baseUrlEnv) ?? backend.defaultBaseURL) !== undefined;
 
   /** Resolve everything one backend needs right before calling it. */
   const arm = async (id) => {
@@ -251,8 +265,9 @@ export function createRouterProvider(ctx, resolveConfig) {
     const backend = BACKENDS[id];
     const keyed = backend.defaultApiKeyEnv !== undefined;
     const apiKey = keyed ? section.apiKey ?? await resolveSecret(section.apiKeyEnv ?? backend.defaultApiKeyEnv) : undefined;
-    const baseURL = section.baseURL
-      ?? (keyed ? undefined : ambient(section.baseUrlEnv ?? "SEARXNG_BASE_URL"));
+    const baseURL = keyed
+      ? section.baseURL
+      : section.baseURL ?? ambient(section.baseUrlEnv ?? backend.meta?.baseUrlEnv);
     return {
       apiKey,
       baseURL: baseURL ?? backend.defaultBaseURL,
@@ -260,20 +275,37 @@ export function createRouterProvider(ctx, resolveConfig) {
     };
   };
 
+  /** Every credential/endpoint variable an auto-mode deployment could use. */
+  const ambientHints = () => [...new Set(ids().flatMap((id) => {
+    const backend = BACKENDS[id];
+    const section = resolveConfig().providers[id] ?? {};
+    if (backend.defaultApiKeyEnv !== undefined) return [section.apiKeyEnv ?? backend.defaultApiKeyEnv];
+    const env = section.baseUrlEnv ?? backend.meta?.baseUrlEnv;
+    return env === undefined ? [] : [env];
+  }))];
+
   return {
     id: SEARCH_ROUTER_PROVIDER_ID,
 
+    /**
+     * Deliberately optimistic, like the shipped web-search-deepseek
+     * provider: a key held only in the managed credentials store cannot be
+     * probed synchronously, and a false `false` here is a hard error at the
+     * seam (the composition points web.searchProvider at this router). The
+     * real verdict — descriptive, naming the variables to export — belongs
+     * to search().
+     */
     available() {
-      return chain().length > 0;
+      return true;
     },
 
     async search(request, signal) {
       if (signal?.aborted === true) throw callerAborted(signal);
-      const ids_ = chain();
+      const ids_ = await chain();
       if (ids_.length === 0) {
         throw new Error(
           "search-router: no search provider is configured — set provider/order in the search-router config, "
-          + "or export EXA_API_KEY / TAVILY_API_KEY / BRAVE_SEARCH_API_KEY / PPLX_API_KEY / DEEPSEEK_API_KEY / SEARXNG_BASE_URL",
+          + `store keys on the Plugins settings page, or export ${ambientHints().join(" / ")}`,
         );
       }
       const failures = [];
@@ -284,7 +316,7 @@ export function createRouterProvider(ctx, resolveConfig) {
         const armed = await arm(id);
         if ((backend.defaultApiKeyEnv !== undefined && armed.apiKey === undefined) || armed.baseURL === undefined) {
           const hint = backend.defaultApiKeyEnv === undefined
-            ? `missing endpoint (set providers.searxng.baseUrl, the Plugins settings page, or export ${section0(resolveConfig(), id).baseUrlEnv ?? "SEARXNG_BASE_URL"})`
+            ? `missing endpoint (set providers.${id}.baseUrl, the Plugins settings page, or export ${section0(resolveConfig(), id).baseUrlEnv ?? backend.meta?.baseUrlEnv})`
             : `missing API key (set providers.${id}.apiKey, the Plugins settings page, or export ${section0(resolveConfig(), id).apiKeyEnv ?? backend.defaultApiKeyEnv})`;
           failures.push(`${id}: ${hint}`);
           log?.info?.(`${id}: ${hint} — skipped${next(id, ids_)}`);

@@ -10,9 +10,10 @@
  * top-level field. Provider endpoint/key overrides that only a composition
  * author needs (per-provider baseURL literals, nested provider sections)
  * stay in the plugin row config; the GUI covers the knobs a user owns:
- * which provider(s) run, the timeout, the empty-results policy, the SearXNG
- * endpoint, and the three commercial API keys (through the credentials
- * domain, never inside the settings document).
+ * which provider(s) run, the timeout, the empty-results policy, endpoint
+ * fields, and the keyed providers' API keys (stored key overrides persist
+ * in the settings document as role('secret') fields; the values themselves
+ * never cross the wire).
  */
 import z from "@deepseek-ai/schemastery";
 
@@ -23,13 +24,14 @@ export const SETTINGS_NS = "search-router";
  * The provider catalog, derived from the router's discovered backends: every
  * field of the settings schema and every shape the card renders comes from a
  * provider's own descriptor (`id`, `defaultApiKeyEnv`, `meta`), so adding a
- * provider file changes nothing here.
+ * provider file changes nothing here. The catalog closes over the backend
+ * index it was built from — no module-level state, so two registrations in
+ * one process never cross wires.
  *
  * @param {Record<string, object>} backends - the router's BACKENDS index.
- * @returns {{ ids: string[], keyed: string[], keyless: string[], envOf: (id: string) => string|undefined, labelOf: (id: string) => string }} the catalog.
+ * @returns the catalog: sorted ids, keyed/keyless splits, and per-id lookups.
  */
 export function providerCatalog(backends) {
-  CATALOG_BACKEND = backends;
   const ids = Object.keys(backends).sort((a, b) => (backends[a].meta?.sort ?? 99) - (backends[b].meta?.sort ?? 99) || a.localeCompare(b));
   return {
     ids,
@@ -37,22 +39,10 @@ export function providerCatalog(backends) {
     keyless: ids.filter((id) => backends[id].defaultApiKeyEnv === undefined),
     envOf: (id) => backends[id].defaultApiKeyEnv,
     labelOf: (id) => backends[id].meta?.label ?? id,
+    needsBaseUrl: (id) => backends[id].defaultBaseURL === undefined && backends[id].meta?.keyless !== true,
   };
 }
 
-/**
- * The settings section schema. Field semantics:
- * - `provider` — single-backend mode ("" = not chosen here);
- * - `order` — fallback-chain mode as a comma/space-separated id list
- *   ("" = not chosen here); exactly one of provider/order may be set;
- * - `timeoutMs` — per-provider timeout;
- * - `emptyResultsFallback` — treat a 0-result success as a failure;
- * - `*ApiKey` — a stored key that OVERRIDES the environment/credential
- *   reference for that provider (`role('secret')`: the wire redacts it, the
- *   settings document persists it); absent = resolve from the environment;
- * - `*ApiKeyEnv` — credential-reference names the router resolves per search;
- * - `<id>BaseUrl` — the endpoint field of a base-URL provider.
- */
 /**
  * Build the settings section schema for one provider catalog. Field
  * semantics (per provider `<id>` from the catalog):
@@ -62,6 +52,8 @@ export function providerCatalog(backends) {
  * - `<id>ApiKey` — a stored key OVERRIDING the environment for keyed
  *   providers (`role('secret')`: persisted, redacted from every response);
  * - `<id>ApiKeyEnv` — the credential reference a keyed provider resolves;
+ * - `<id>KeyPreset` — base-layer marker: the composition carries a literal
+ *   key for this provider (the key itself never crosses the wire);
  * - `<id>BaseUrl` — the endpoint field of a base-URL provider (SearXNG).
  *
  * @param {ReturnType<providerCatalog>} catalog - the provider catalog.
@@ -75,14 +67,15 @@ export const settingsConfig = (catalog) => z.object({
   ...Object.fromEntries(catalog.keyed.flatMap((id) => [
     [`${id}ApiKey`, z.string().role("secret")],
     [`${id}ApiKeyEnv`, z.string().role("credential-ref").default(catalog.envOf(id))],
+    [`${id}KeyPreset`, z.const(true)],
   ])),
-  ...Object.fromEntries(catalog.ids.filter((id) => needsBaseUrl(catalog, id)).map((id) => [`${id}BaseUrl`, z.string().default("")])),
+  ...Object.fromEntries(catalog.ids.filter((id) => catalog.needsBaseUrl(id)).map((id) => [`${id}BaseUrl`, z.string().default("")])),
   // One declared field per provider carries its existence and display label
   // to the browser half — including pure keyless providers that have no
   // other field — so the card's catalog is complete without hardcoding ids.
   ...Object.fromEntries(catalog.ids.map((id) => {
     const marker = z.const(true);
-    marker.meta = { ...marker.meta, providerLabel: labelOf(id) };
+    marker.meta = { ...marker.meta, providerLabel: catalog.labelOf(id) };
     return [`${id}Provider`, marker];
   })),
 });
@@ -123,7 +116,7 @@ export const validateSection = (catalog) => (section) => {
       throw new Error(`search-router: "order" names no providers (expected ${catalog.ids.join(", ")})`);
     }
   }
-  for (const id of catalog.ids.filter((candidate) => needsBaseUrl(catalog, candidate))) {
+  for (const id of catalog.ids.filter((candidate) => catalog.needsBaseUrl(candidate))) {
     const url = String(section[`${id}BaseUrl`] ?? "").trim();
     if (url === "") continue;
     let parsed;
@@ -144,20 +137,6 @@ export const validateSection = (catalog) => (section) => {
   }
 };
 
-/** A provider's display label (meta.label, else the id). */
-function labelOf(id) {
-  return CATALOG_BACKEND?.[id]?.meta?.label ?? id;
-}
-
-/** The backend index the module last built a catalog for. */
-let CATALOG_BACKEND = {};
-
-/** True when a provider's endpoint is user-configurable (no default origin). */
-function needsBaseUrl(catalog, id) {
-  const backend = CATALOG_BACKEND[id];
-  return backend !== undefined && backend.defaultBaseURL === undefined && backend.meta?.keyless !== true;
-}
-
 /**
  * Project the composition config into the flat settings shape, used as the
  * settings register's `base` layer: schema defaults < this base < user layer.
@@ -175,7 +154,10 @@ export const projectBase = (catalog) => (composition) => {
     timeoutMs: composition.timeoutMs,
     emptyResultsFallback: composition.emptyResultsFallback,
     ...Object.fromEntries(catalog.keyed.map((id) => [`${id}ApiKeyEnv`, section(id).apiKeyEnv ?? catalog.envOf(id)])),
-    ...Object.fromEntries(catalog.ids.filter((id) => needsBaseUrl(catalog, id)).map((id) => [`${id}BaseUrl`, section(id).baseURL ?? ""])),
+    // Flag — never the value — that the composition carries a literal key:
+    // the card shows the provider as configured, the key stays off the wire.
+    ...Object.fromEntries(catalog.keyed.filter((id) => typeof section(id).apiKey === "string").map((id) => [`${id}KeyPreset`, true])),
+    ...Object.fromEntries(catalog.ids.filter((id) => catalog.needsBaseUrl(id)).map((id) => [`${id}BaseUrl`, section(id).baseURL ?? ""])),
   };
 };
 
@@ -232,7 +214,7 @@ export const mergeRuntime = (catalog) => (composition, resolved, base) => {
     const envField = `${id}ApiKeyEnv`;
     if (chosen(envField)) section(id).apiKeyEnv = resolved[envField];
   }
-  for (const id of catalog.ids.filter((candidate) => needsBaseUrl(catalog, candidate))) {
+  for (const id of catalog.ids.filter((candidate) => catalog.needsBaseUrl(candidate))) {
     const field = `${id}BaseUrl`;
     if (chosen(field)) section(id).baseURL = resolved[field] === "" ? undefined : resolved[field];
   }

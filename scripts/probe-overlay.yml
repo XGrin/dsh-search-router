@@ -3,4 +3,4 @@
 # plugin's own patch).
 - insert:
     - id: search-probe
-      name: /Users/xgrin/Desktop/dsh-plugin/dsh-search-router/test/probe.mjs
+      name: /Users/xgrin/Desktop/dsh-plugin/dsh-search-router/scripts/probe.mjs
