@@ -55,8 +55,8 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-settings-file": "^0.0.1-rc.3",
-    "@deepseek-ai/dsh-web": "^0.0.1-rc.1"
+    "@deepseek-ai/dsh-settings-file": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-web": "^0.1.0-rc.8"
   },
   "scripts": {
     "providers": "node scripts/gen-providers.mjs",
