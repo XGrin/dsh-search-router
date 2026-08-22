@@ -1009,7 +1009,11 @@ window.__ModuleLoader__.load({
 			const { api } = ctx.get("connection");
 			ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), "search-router: card dictionary");
 			const controller = new SearchRouterCardController(ctx.settingsScope.bind({ namespace: NS }), api);
-			ctx.effect(() => ctx.remote.$on("credentials/updated", (ref) => {
+			// Credential invalidations: dsh forwards `credentials/reference-updated`
+			// (single ref-string payload) whenever a watched reference's stored
+			// value changes, so the card's credential dots refresh without a
+			// page round-trip.
+			ctx.effect(() => ctx.remote.$on("credentials/reference-updated", (ref) => {
 				controller.refreshCredential(ref);
 			}), "search-router: credential invalidations");
 			ctx.slots.inject(ITEM_SLOT, () => ctx.slots.register({

@@ -426,6 +426,7 @@ try {
       }),
     },
   };
+  const subscribedEvents = [];
   const ctx2 = {
     get: (name) => (name === "connection" ? { api: api2 } : undefined),
     effect: (effect) => {
@@ -433,12 +434,17 @@ try {
       return () => void dispose?.();
     },
     locale: { register: () => () => {} },
-    remote: { $on: () => () => {} },
+    remote: { $on: (event) => {
+      subscribedEvents.push(event);
+      return () => {};
+    } },
     settingsScope: { bind: () => scope },
     slots: { inject: (slot, factory) => factory(), register: (options) => { slotRegistrations.push({ options }); return () => {}; } },
   };
   exports.apply(ctx2);
   await flush();
+  check("subscribes to the credential-invalidation event", subscribedEvents.includes("credentials/reference-updated"), subscribedEvents);
+  check("subscribes exactly one credential event", subscribedEvents.length === 1, subscribedEvents);
   const fresh = slotRegistrations.at(-1)?.options.inject();
   const first = fresh.hooks.searchRouterCard.getSnapshot();
   check("fresh bind shows the env-keyed provider on the FIRST frame", first.chain.includes("tavily") === true, { chain: first.chain });
