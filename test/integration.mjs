@@ -5,11 +5,10 @@
  * requests to a provider's shipped default origin are rewritten to the local
  * mock server by a wrapped fetch.
  *
- *   node test/integration.mjs [dir-containing-@deepseek-ai]
+ *   node test/integration.mjs (installed packages; or DSH_ROOT + tsx)
  *
- * Defaults to this package's own node_modules (`npm install` installs the
- * devDependencies), or pass any DSH installation's node_modules (e.g. an npx
- * cache) / set DSH_MODULES. Cases map to the acceptance matrix: single
+ * Uses the current DSH packages, or DSH_ROOT with the source loader.
+ * Fixtures are retained under .local/test-runs. Cases map to the acceptance matrix: single
  * provider, fallback on 429/timeout, all-fail aggregation, empty-results
  * policy, caller cancellation, auto-detection (zero-config, canonical order,
  * env isolation), settings layering, seam-level truncation.
@@ -18,17 +17,18 @@ import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 
 /* ------------------------------------------------------------------ setup */
 
-const modulesDir = resolve(process.argv[2] ?? process.env.DSH_MODULES ?? "node_modules");
-const { Context } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/cordis/lib/index.js")).href);
-const { default: WebRuntime } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-web/lib/index.js")).href);
-const { default: FileSettingsProvider } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-settings-file/lib/index.js")).href);
-const routerPlugin = await import(pathToFileURL(resolve("src/index.js")).href);
-const settingsExports = await import(pathToFileURL(resolve("src/settings.js")).href);
+import { Context, WebRuntime, settingsFixture } from "./host-fixture.mjs";
+import { readFileSync } from "node:fs";
+const routerPlugin = await import("../src/index.js");
+const socketFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+  const url = new URL(String(input));
+  if (url.hostname !== "127.0.0.1") throw new Error("Test blocked external request: " + url.origin);
+  return socketFetch(input, init);
+};
 
 /** Mutable mock-endpoint behavior; each case adjusts what it needs. */
 const behavior = {
@@ -88,6 +88,12 @@ const server = createServer((request, response) => {
       response.writeHead(what.status, { "content-type": "application/json" });
       response.end(JSON.stringify(what.body ?? {}));
     };
+    if (request.url?.startsWith("/body-hang/")) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.flushHeaders();
+      response.write('{"results":[');
+      return; // Headers arrive, but the body never completes.
+    }
     if (request.url?.startsWith("/hang/")) {
       if (!behavior.hang) send({ status: 200, body: {} });
       return; /* never respond: the caller times out */
@@ -168,17 +174,9 @@ async function boot(config, env = {}, options = {}) {
     }
   };
   const ctx = new Context();
-  if (options.settingsPath !== undefined) ctx.plugin(FileSettingsProvider, { path: options.settingsPath, watch: false });
   ctx.plugin(WebRuntime, { searchProvider: "search-router" });
   const fiber = ctx.plugin(routerPlugin, config);
   await fiber;
-  if (options.settingsPath !== undefined) {
-    const started = Date.now();
-    while (Date.now() - started < 2000) {
-      if (ctx.settings.describe().some((view) => view.ns === "search-router")) break;
-      await sleep(25);
-    }
-  }
   return { ctx, restore };
 }
 
@@ -226,7 +224,7 @@ console.log("case 1: single provider — exa success through the real seam");
   ]);
   eq("truncated flag", result.truncated, false);
   check("query forwarded verbatim", seen.exa.at(-1)?.body.includes('"query":"dsh plugins"'), seen.exa.at(-1));
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -240,7 +238,7 @@ console.log("case 1b: seam-level maxResults truncation");
   const result = await ctx.web.search({ query: "q", maxResults: 1 });
   eq("seam truncates to maxResults", result.sources.map((s) => s.url), ["https://example.com/1"]);
   eq("seam flags truncation", result.truncated, true);
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -257,7 +255,7 @@ console.log("case 2: primary 429 — fallback to tavily");
   eq("tavily snippet + parsed date", result.sources[0].snippet, "tavily result");
   check("exa was tried first", seen.exa.length >= 1);
   behavior.exa = { status: 200, body: { results: [] } };
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -273,8 +271,27 @@ console.log("case 3: primary timeout — fallback to searxng");
   const elapsed = Date.now() - started;
   eq("searxng answered", result.sources.map((s) => s.url), ["https://example.com/s1"]);
   check("timeout honored (~>=700ms)", elapsed >= 650, { elapsed });
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
+}
+
+console.log("case 3b: response-body timeout and cancellation");
+{
+  const { ctx, restore } = await boot({
+    order: ["exa", "searxng"], timeoutMs: 300,
+    providers: providersBase({ exa: { apiKey: "k", baseURL: `${base}/body-hang` } }),
+  });
+  const started = Date.now();
+  const result = await ctx.web.search({ query: "stalled body", maxResults: 3 }, AbortSignal.timeout(2000));
+  eq("body timeout falls back", result.sources.map(s => s.url), ["https://example.com/s1"]);
+  check("body timeout bounded", Date.now() - started < 1800);
+  const previous = seen.searxng.length;
+  let error;
+  try { await ctx.web.search({ query: "cancel stalled body" }, AbortSignal.timeout(100)); }
+  catch (thrown) { error = thrown; }
+  check("body read respects caller cancellation", /aborted/i.test(String(error)));
+  eq("cancel does not try next provider", seen.searxng.length, previous);
+  await ctx.fiber.dispose(); restore();
 }
 
 console.log("case 4: all providers fail — one aggregated error, no keys leaked");
@@ -300,7 +317,7 @@ console.log("case 4: all providers fail — one aggregated error, no keys leaked
   behavior.exa = { status: 200, body: { results: [] } };
   behavior.tavily = { status: 200, body: { results: [] } };
   behavior.searxng = { status: 200, body: { results: [] } };
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -313,7 +330,7 @@ console.log("case 5: all providers empty — truthful empty result, not an error
   });
   const result = await ctx.web.search({ query: "obscure", maxResults: 5 });
   eq("empty sources returned", result.sources, []);
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -329,7 +346,7 @@ console.log("case 5b: emptyResultsFallback: false — first empty wins");
   const result = await ctx.web.search({ query: "accept empty", maxResults: 5 });
   eq("empty exa result returned without fallback", result.sources, []);
   check("searxng not consulted", seen.searxng.every((s) => !s.url.includes("s9")), seen.searxng.at(-1));
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -350,7 +367,7 @@ console.log("case 6: caller cancellation propagates, is not a fallback");
     error = thrown;
   }
   check("aborts with caller cancellation", /aborted/i.test(String(error)), String(error));
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -366,7 +383,7 @@ console.log("case 7: missing credentials are skipped, later provider used");
   const result = await ctx.web.search({ query: "no brave key", maxResults: 5 });
   eq("searxng answered after unarmed brave was skipped", result.sources.map((s) => s.url), ["https://example.com/s1"]);
   check("brave endpoint never hit", seen.brave.every((s) => !s.url.includes("b1")), seen.brave.at(-1));
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -382,7 +399,7 @@ console.log("case 8: auto-detection from ambient env + available()");
   check("available() true with a detected provider", provider?.available() === true);
   const result = await ctx.web.search({ query: "auto", maxResults: 5 });
   eq("ambient-key exa answered", result.sources.map((s) => s.url), ["https://example.com/1", "https://example.com/2"]);
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -401,7 +418,7 @@ console.log("case 9: zero-config — keyless DuckDuckGo serves with nothing set 
     check("default DDG origin was used (rewritten to the mock)", seen.duckduckgo.at(-1)?.url.startsWith("/duckduckgo/html"), seen.duckduckgo.at(-1));
   } finally {
     unredirect();
-    await ctx?.cleanup?.() ?? await ctx?.dispose?.();
+    await ctx?.fiber.dispose();
     restore?.();
   }
 }
@@ -417,7 +434,7 @@ console.log("case 8b: auto-chain follows meta.sort, not file-name order");
   const result = await ctx.web.search({ query: "ordering", maxResults: 5 });
   eq("exa (meta.sort 1) leads, deepseek (sort 5) answers after its 429", result.sources.map((s) => s.url), ["https://example.com/d1", "https://example.com/d2"]);
   check("exa was tried first despite 'deepseek' sorting first by file name", seen.exa.length >= 1, seen.exa.at(-1));
-  await ctx.cleanup?.() ?? await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -436,208 +453,91 @@ console.log("case 8c: SEARXNG_BASE_URL arms SearXNG only — DuckDuckGo keeps it
     check("duckduckgo hit its own origin, not the SearXNG endpoint", seen.duckduckgo.at(-1)?.url.startsWith("/duckduckgo/html"), seen.duckduckgo.at(-1));
   } finally {
     unredirect();
-    await ctx?.cleanup?.() ?? await ctx?.dispose?.();
+    await ctx?.fiber.dispose();
     restore?.();
   }
 }
 
-console.log("case 10: bad config fails loudly at load");
+console.log("case 10: current Config validation rejects invalid persisted choices");
 {
-  let error;
-  try {
-    routerPlugin.apply({ web: { registerSearchProvider() {} }, logger: undefined }, { provider: "google" });
-  } catch (thrown) {
-    error = thrown;
-  }
-  check("unknown provider rejected", /unknown provider "google"/.test(String(error)), String(error));
-  error = undefined;
-  try {
-    routerPlugin.apply({ web: { registerSearchProvider() {} }, logger: undefined }, { provider: "exa", order: ["exa"] });
-  } catch (thrown) {
-    error = thrown;
-  }
-  check("provider XOR order enforced", /not both/.test(String(error)), String(error));
-  error = undefined;
-  try {
-    routerPlugin.apply({ web: { registerSearchProvider() {} }, logger: undefined }, { providers: { exa: { model: "gpt-imagine" } } });
-  } catch (thrown) {
-    error = thrown;
-  }
-  check("model rejected for a provider without defaultModel", /providers\.exa\.model is not configurable/.test(String(error)), String(error));
-  let accepted = true;
-  try {
-    routerPlugin.apply({ web: { registerSearchProvider() {} }, inject: () => {}, logger: undefined }, { providers: { perplexity: { model: "sonar-pro" } } });
-  } catch (thrown) {
-    accepted = false;
-    console.log(`      (threw: ${String(thrown)})`);
-  }
-  check("model accepted where the descriptor declares defaultModel", accepted);
+  const validate = raw => routerPlugin.Config["~standard"].validate(raw);
+  for (const config of [
+    { provider: "google" }, { provider: "exa", order: ["exa"] }, { order: [] },
+    { providers: { exa: { model: "invalid" } } }, { providers: { searxng: { baseURL: "ftp://example.com" } } },
+    { providers: { exa: { apiKey: "   " } } }, { unexpected: true },
+  ]) check("invalid configuration refused", !!validate(config).issues, config);
+  check("known model and explicit cleared routing accepted", !validate({
+    provider: null, order: ["deepseek"], providers: { deepseek: { model: "deepseek-v4-flash" } },
+  }).issues);
 }
 
-console.log("case 11: settings section is served for the Plugins page");
-{
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    const { ctx, restore } = await boot({
-      provider: "exa",
-      timeoutMs: 2000,
-      providers: providersBase(),
-    }, {}, { settingsPath });
-    const views = ctx.settings.describe();
-    const view = views.find((candidate) => candidate.ns === "search-router");
-    check("namespace registered", view !== undefined, views.map((v) => v.ns));
-    check("applies live", view?.applies === "live", view?.applies);
-    const expectedSection = {
-      provider: "exa", order: "", timeoutMs: 2000, emptyResultsFallback: true,
-      exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
-      perplexityApiKeyEnv: "PPLX_API_KEY", deepseekApiKeyEnv: "DEEPSEEK_API_KEY",
-      exaKeyPreset: true, tavilyKeyPreset: true, braveKeyPreset: true,
-      perplexityKeyPreset: true, deepseekKeyPreset: true,
-      searxngBaseUrl: `${base}/searxng`,
-    };
-    eq("base projects the composition", view?.base, expectedSection);
-    eq("resolved section carries schema defaults over base", view?.value, expectedSection);
-    await ctx.dispose?.();
-    restore();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-console.log("case 12: settings writes re-route live searches (the GUI path)");
+console.log("cases 11–16: real DSH ConfigEditor, persistence, atomic routing and redaction");
 {
   resetBehavior();
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
+  const f = await settingsFixture(routerPlugin, { provider: "exa", timeoutMs: 2000, providers: providersBase() });
+  let ctx = f.ctx;
+  const descriptor = () => ctx.settings.describe({ redactSecrets: true }).find(row => row.ns === "search-router");
+  const search = query => ctx.web.search({ query, maxResults: 5 });
   try {
-    const { ctx, restore } = await boot({
-      provider: "exa",
-      timeoutMs: 2000,
-      providers: providersBase(),
-    }, {}, { settingsPath });
-    const before = await ctx.web.search({ query: "via composition", maxResults: 5 });
-    eq("composition routing first", before.sources.map((s) => s.url), ["https://example.com/1", "https://example.com/2"]);
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["provider"], value: "searxng" }]);
-    const after = await ctx.web.search({ query: "via settings", maxResults: 5 });
-    eq("settings write re-routes to searxng", after.sources.map((s) => s.url), ["https://example.com/s1"]);
-    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["provider"] }]);
-    const reverted = await ctx.web.search({ query: "back to composition", maxResults: 5 });
-    eq("unset reverts to the composition layer", reverted.sources.map((s) => s.url), ["https://example.com/1", "https://example.com/2"]);
-    await ctx.dispose?.();
-    restore();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-console.log("case 13: settings validation refuses contradictory writes");
-{
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    const { ctx, restore } = await boot({ timeoutMs: 2000 }, {}, { settingsPath });
+    const original = descriptor();
+    check("namespace is exposed and live", original?.applies === "live");
+    check("nested schema exposes configuration", original?.value?.provider === "exa");
+    check("entire response hides test secrets", !JSON.stringify(original).includes("test-exa-key"));
+    check("nested secret sidecar is present", original.secrets.some(s => s.path.join(".") === "providers.exa.apiKey" && s.set));
+    const fiber = [...ctx.loader.entries()].find(e => e.options.id === "search-router").fiber;
+    eq("initial single-provider search", (await search("initial")).sources.map(s => s.url), ["https://example.com/1", "https://example.com/2"]);
+    await ctx.settings.mutate("search-router", [
+      { op: "set", path: ["provider"], value: null },
+      { op: "set", path: ["order"], value: ["deepseek", "exa"] },
+    ], original.revision);
+    eq("atomic switch routes immediately", (await search("new route")).sources.map(s => s.url), ["https://example.com/d1", "https://example.com/d2"]);
+    check("live update preserves plugin fiber", [...ctx.loader.entries()].find(e => e.options.id === "search-router").fiber === fiber);
+    const beforeFailure = readFileSync(f.profile.patchPath, "utf8");
     let error;
-    try {
-      await ctx.settings.mutate("search-router", [
-        { op: "set", path: ["provider"], value: "exa" },
-        { op: "set", path: ["order"], value: "exa, searxng" },
-      ]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("provider XOR order refused", /not both/.test(String(error)), String(error));
+    try { await ctx.settings.mutate("search-router", [{ op: "set", path: ["timeoutMs"], value: 3000 }], original.revision); }
+    catch (e) { error = e; }
+    check("stale revision refused", /changed since/.test(String(error)), String(error));
+    eq("conflict leaves profile unchanged", readFileSync(f.profile.patchPath, "utf8"), beforeFailure);
     error = undefined;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: "google, exa" }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("unknown id in order refused", /unknown provider "google"/.test(String(error)), String(error));
+    try { await ctx.settings.mutate("search-router", [{ op: "set", path: ["provider"], value: "exa" }]); }
+    catch (e) { error = e; }
+    check("contradictory route rejected before persistence", /not both/.test(String(error)), String(error));
+    eq("invalid config leaves profile unchanged", readFileSync(f.profile.patchPath, "utf8"), beforeFailure);
+    await ctx.settings.mutate("search-router", [{ op: "set", path: ["providers", "exa", "apiKey"], value: "replacement-test-key" }]);
+    await ctx.settings.mutate("search-router", [
+      { op: "set", path: ["order"], value: null }, { op: "set", path: ["provider"], value: "exa" },
+      { op: "set", path: ["timeoutMs"], value: 2500 },
+    ]);
+    await search("key preserved");
+    check("ordinary writes preserve hidden key", seen.exa.at(-1)?.key === "replacement-test-key");
+    check("new key hidden from entire response", !JSON.stringify(descriptor()).includes("replacement-test-key"));
+    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["providers", "exa", "apiKey"] }]);
+    await search("inherited key");
+    check("key reset re-inherits original key", seen.exa.at(-1)?.key === "test-exa-key");
+    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["timeoutMs"] }]);
+    check("reset re-inherits configuration", descriptor().value.timeoutMs === 2000);
+    await ctx.settings.mutate("search-router", [
+      { op: "set", path: ["provider"], value: null }, { op: "set", path: ["order"], value: ["exa", "searxng"] },
+    ]);
+    behavior.exa.status = 429;
+    eq("saved chain falls back", (await search("fallback")).sources.map(s => s.url), ["https://example.com/s1"]);
+    await ctx.settings.mutate("search-router", [{ op: "set", path: ["providers", "searxng", "baseURL"], value: base + "/nothing" }]);
     error = undefined;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: ", ," }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("order that names nothing refused", /names no providers/.test(String(error)), String(error));
+    try { await search("changed endpoint"); } catch (e) { error = e; }
+    check("nested endpoint takes effect", /searxng: HTTP 404/.test(String(error)), String(error));
+    await ctx.fiber.dispose();
+    ctx = await f.start();
+    check("routing survives host restart", descriptor().value.order.join(",") === "exa,searxng");
+    const routerFiber = [...ctx.loader.entries()].find(e => e.options.id === "search-router").fiber;
+    await routerFiber.dispose();
     error = undefined;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["searxngBaseUrl"], value: "search.example.com" }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("scheme-less searxng URL refused", /http\(s\) URL/.test(String(error)), String(error));
-    const views = ctx.settings.describe();
-    const view = views.find((candidate) => candidate.ns === "search-router");
-    eq("refused writes stored nothing", view?.user, void 0);
-    await ctx.dispose?.();
-    restore();
+    try { await search("after disposal"); } catch (e) { error = e; }
+    check("disposed provider is unregistered", /not registered|missing|configured/i.test(String(error)), String(error));
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await ctx.fiber.dispose();
+    resetBehavior();
   }
-}
-
-console.log("case 14: settings fallback order and merge semantics");
-{
-  resetBehavior();
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    behavior.exa = { status: 429, body: {} };
-    const { ctx, restore } = await boot({ timeoutMs: 2000, providers: providersBase() }, {}, { settingsPath });
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: "exa, searxng" }]);
-    const result = await ctx.web.search({ query: "chain via settings", maxResults: 5 });
-    eq("order string drives the fallback chain", result.sources.map((s) => s.url), ["https://example.com/s1"]);
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["searxngBaseUrl"], value: `${base}/nothing` }]);
-    let error;
-    try {
-      await ctx.web.search({ query: "endpoint moved", maxResults: 5 });
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("searxngBaseUrl override applies", /searxng: HTTP 404/.test(String(error)), String(error));
-    await ctx.dispose?.();
-    restore();
-    behavior.exa = structuredClone(defaults.exa);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-console.log("case 16: a key stored in settings overrides the ambient environment");
-{
-  resetBehavior();
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    const { ctx, restore } = await boot({
-      timeoutMs: 2000,
-      providers: { exa: { baseURL: `${base}/exa` }, tavily: {}, brave: {}, searxng: {} },
-    }, { EXA_API_KEY: "ambient-env-key" }, { settingsPath });
-    const first = await ctx.web.search({ query: "ambient key", maxResults: 5 });
-    check("ambient env key reaches the provider", first.sources.length === 2 && seen.exa.at(-1)?.key === "ambient-env-key", seen.exa.at(-1));
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["exaApiKey"], value: "settings-stored-key" }]);
-    const second = await ctx.web.search({ query: "stored key", maxResults: 5 });
-    check("settings-stored key overrides the environment", second.sources.length === 2 && seen.exa.at(-1)?.key === "settings-stored-key", seen.exa.at(-1));
-    const redacted = ctx.settings.describe({ redactSecrets: true }).find((view) => view.ns === "search-router");
-    check("redacted view hides the stored key", !JSON.stringify(redacted?.value ?? {}).includes("settings-stored-key"), redacted?.value);
-    check("secret sidecar reports the slot as set", redacted?.secrets?.some((secret) => secret.path?.[0] === "exaApiKey" && secret.set === true), redacted?.secrets);
-    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["exaApiKey"] }]);
-    const third = await ctx.web.search({ query: "back to ambient", maxResults: 5 });
-    check("unsetting falls back to the environment", third.sources.length === 2 && seen.exa.at(-1)?.key === "ambient-env-key", seen.exa.at(-1));
-    let error;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["exaApiKey"], value: "  " }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("blank key refused", /non-empty/.test(String(error)), String(error));
-    await ctx.dispose?.();
-    restore();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  console.log("  isolated profile retained at " + f.home);
 }
 
 console.log("case 17: provider markup is stripped from snippets");
@@ -653,7 +553,7 @@ console.log("case 17: provider markup is stripped from snippets");
   });
   const result = await ctx.web.search({ query: "strip markup", maxResults: 5 });
   check("tags removed, text kept", result.sources[0]?.snippet === "a bold linked query", result.sources[0]);
-  await ctx.dispose?.();
+  await ctx.fiber.dispose();
   restore();
 }
 
@@ -672,7 +572,7 @@ console.log("case 18: perplexity, deepseek, duckduckgo backends");
       { url: "https://example.com/p1", title: "Perplexity one", snippet: "perplexity result with markup", publishedAt: "2026-01-02" },
     ]);
     check("perplexity sends model + bearer auth", seen.perplexity.at(-1)?.body.includes('"model"') && seen.perplexity.at(-1)?.body.includes('"sonar"'), seen.perplexity.at(-1));
-    await ctx.cleanup?.() ?? await ctx.dispose?.();
+    await ctx.fiber.dispose();
     restore();
   }
   {
@@ -683,7 +583,7 @@ console.log("case 18: perplexity, deepseek, duckduckgo backends");
       { url: "https://example.com/d2", title: "DeepSeek two" },
     ]);
     check("deepseek sends the web_search tool", seen.deepseek.at(-1)?.body.includes("web_search_20250305"), seen.deepseek.at(-1));
-    await ctx.cleanup?.() ?? await ctx.dispose?.();
+    await ctx.fiber.dispose();
     restore();
   }
   {
@@ -704,37 +604,9 @@ console.log("case 18: perplexity, deepseek, duckduckgo backends");
       error = thrown;
     }
     check("HTTP failure surfaces in the aggregate", /duckduckgo: HTTP 403/.test(String(error)), String(error));
-    await ctx.cleanup?.() ?? await ctx.dispose?.();
+    await ctx.fiber.dispose();
     restore();
   }
-}
-
-console.log("case 15: mergeRuntime layering as a pure function");
-{
-  const { BACKENDS } = await import(pathToFileURL(resolve("src/router.js")).href);
-  const catalog = settingsExports.providerCatalog(BACKENDS);
-  const base = settingsExports.projectBase(catalog)({ provider: "exa", order: undefined, timeoutMs: 5000, emptyResultsFallback: true, providers: {} });
-  const merge = (resolved) => settingsExports.mergeRuntime(catalog)({ provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {} }, resolved, base);
-  eq("identical resolution inherits the composition", merge(structuredClone(base)), {
-    provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("changed timeoutMs overrides only that field", merge({ ...structuredClone(base), timeoutMs: 1500 }), {
-    provider: "exa", timeoutMs: 1500, emptyResultsFallback: true, providers: {},
-  });
-  eq("order set clears a composition provider", merge({ ...structuredClone(base), order: "searxng" }), {
-    order: ["searxng"], timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("explicit Automatic clears composition routing", merge({ ...structuredClone(base), provider: "" }), {
-    timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("undefined section is the composition itself", merge(void 0), {
-    provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("stored key becomes the provider's literal apiKey", settingsExports.mergeRuntime(catalog)(
-    { timeoutMs: 5000, providers: {} },
-    { ...structuredClone(base), provider: "", tavilyApiKey: "k" },
-    base,
-  ).providers.tavily, { apiKey: "k" });
 }
 
 /* ------------------------------------------------------------------- done */

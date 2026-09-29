@@ -1,27 +1,4 @@
-/**
- * dsh-search-router — browser half.
- *
- * Plain JavaScript (no JSX, no TypeScript, no build step): the web shell's
- * module loader executes this classic script to register the factory, and
- * materializes it when the boot graph imports the package. It contributes
- * exactly one thing to the UI: the "Search router" card in Settings →
- * Plugins → Plugin configuration, keyed on the `search-router` settings
- * namespace the host half serves.
- *
- * The card manages the fallback CHAIN the way the Models page manages
- * providers: one row card per active provider, numbered by priority,
- * draggable to reorder (a tail drop zone moves a row to the end; the grip
- * also reorders by keyboard with ArrowUp/ArrowDown), with credential-state
- * dots, an inline editor per provider, and a dashed "add provider" flow for
- * the rest. Every structural change (drag, add, remove) commits the `order`
- * field immediately through the settings scope. API keys persist in the
- * settings document as role('secret') fields and override the environment;
- * the value itself is redacted from every wire crossing, so the card learns
- * only whether one is stored (the describe sidecar's set flag, plus the
- * base-layer flag that marks a key preset in the profile config). With no
- * explicit order stored, the card shows the auto-detected chain (every
- * provider whose key or endpoint resolves) and a banner explaining it.
- */
+/** DSH 0.1.7 browser bundle: live nested Config, shared mirror, and third-party settings page. */
 window.__ModuleLoader__.load({
 	id: "dsh-search-router",
 	factory: (require) => {
@@ -38,7 +15,7 @@ window.__ModuleLoader__.load({
 		/** Locale dictionary namespace for this card's copy. */
 		const LOCALE_NS = "searchRouter.card";
 		/** The Plugins page's keyed card slot. */
-		const ITEM_SLOT = "settings.plugin.item";
+		const ITEM_SLOT = "plugins.bundle.config";
 		/** Sentinel row key for the drag-to-end drop zone. */
 		const TAIL = "__tail__";
 
@@ -52,40 +29,29 @@ window.__ModuleLoader__.load({
 		 * Derive the provider catalog from the settings namespace's
 		 * SERIALIZED schema envelope (`settings.describe`'s `schema` field —
 		 * schemastery's `toJSON()` reffed form; the scope snapshot itself
-		 * carries only values). The schema's own field set names every
-		 * provider — an `<id>Provider` marker (carrying `meta.label`)
-		 * declares it, `<id>ApiKeyEnv` marks it keyed — so the card knows no
-		 * provider ids itself and adding a provider file changes nothing
-		 * here.
+		 * carries only values). Nested providers.<id> sections and their
+		 * metadata declare labels, credential references and endpoint needs.
+		 * Adding a provider file therefore needs no client catalog edit.
 		 * @param envelope - the serialized schema envelope (uid + refs).
 		 * @returns {{ ids: string[], keyed: string[], labels: Record<string, string> }} the catalog.
 		 */
 		function catalogFromEnvelope(envelope) {
-			if (envelope === null || typeof envelope !== "object") return EMPTY_CATALOG;
-			const refs = envelope.refs ?? {};
-			/** Dict values are uid pointers (bare numbers or `{uid}` cells). */
-			const deref = (entry) => {
-				if (typeof entry === "number") return refs[entry];
-				if (entry !== null && typeof entry === "object" && entry.uid !== void 0) return refs[entry.uid];
-				return entry;
-			};
-			const root = deref(envelope);
-			const dict = root !== null && typeof root === "object" ? root.dict : void 0;
-			if (dict === null || typeof dict !== "object") return EMPTY_CATALOG;
-			const ids = [];
-			const keyed = [];
-			const labels = {};
-			for (const field of Object.keys(dict)) {
-				const marker = /^(\w+)Provider$/.exec(field);
-				if (marker === null) continue;
-				const id = marker[1];
-				ids.push(id);
-				if (dict[`${id}ApiKeyEnv`] !== undefined) keyed.push(id);
-				const meta = deref(dict[field])?.meta;
-				if (meta !== null && typeof meta === "object" && typeof meta.providerLabel === "string") labels[id] = meta.providerLabel;
-			}
-			return { ids, keyed, labels };
-		}
+      if (envelope === null || typeof envelope !== "object") return EMPTY_CATALOG;
+      const refs = envelope.refs ?? {};
+      const deref = entry => typeof entry === "number" ? refs[entry]
+        : entry?.uid !== undefined ? refs[entry.uid] : entry;
+      const dict = deref(deref(envelope)?.dict?.providers)?.dict;
+      if (!dict) return EMPTY_CATALOG;
+      const ids = Object.keys(dict), keyed = [], endpoints = [], labels = {}, envs = {}, baseUrlEnvs = {};
+      for (const id of ids) {
+        const meta = deref(dict[id])?.meta ?? {};
+        labels[id] = meta.providerLabel ?? id;
+        if (meta.providerKeyEnv) { keyed.push(id); envs[id] = meta.providerKeyEnv; }
+        if (meta.providerNeedsBaseUrl) endpoints.push(id);
+        if (meta.providerBaseUrlEnv) baseUrlEnvs[id] = meta.providerBaseUrlEnv;
+      }
+      return { ids, keyed, endpoints, labels, envs, baseUrlEnvs };
+    }
 
 		//#endregion
 		//#region stylesheet (values mirror the Models settings page)
@@ -184,11 +150,6 @@ window.__ModuleLoader__.load({
 		//#endregion
 		//#region controller
 
-		/** Split an `order` string into known backend ids, order preserved. */
-		function parseOrder(text, knownIds) {
-			return String(text ?? "").split(/[\s,]+/u).filter((token) => token.length > 0 && knownIds.includes(token));
-		}
-
 		/**
 		 * The card's state: the settings scope, the credentials domain, and the
 		 * derived chain. Structural changes commit immediately — one scoped
@@ -197,351 +158,200 @@ window.__ModuleLoader__.load({
 		 * so useSyncExternalStore sees a stable reference between changes.
 		 */
 		class SearchRouterCardController {
-			/** @param scope - the bound `search-router` settings scope. @param api - the connection wire face. */
-			constructor(scope, api) {
-				this.scope = scope;
-				this.api = api;
-				this.listeners = new Set();
-				this.busy = false;
-				this.status = void 0;
-				this.credentials = {};
-				this.stored = {};
-				/** The provider catalog, derived from the wire schema envelope. */
-				this.catalog = EMPTY_CATALOG;
-				scope.subscribe(() => {
-					this.readState();
-					this.publish();
-				});
-				this.cached = this.projection();
-				this.readState();
-			}
+      constructor(scope, mirror, remote) {
+        this.scope = scope;
+        this.mirror = mirror;
+        this.remote = remote;
+        this.listeners = new Set();
+        this.busy = false;
+        this.disposed = false;
+        this.generation = 0;
+        this.credentials = {};
+        this.stored = {};
+        this.catalog = EMPTY_CATALOG;
+        this.cached = this.projection();
+        this.disposers = [
+          scope.subscribe(() => this.readState()),
+          mirror.subscribe(() => this.readState()),
+        ];
+        this.readState();
+      }
 
-			/** The store the component reads through useSyncExternalStore. */
-			view = {
-				getSnapshot: () => this.cached,
-				subscribe: (listener) => {
-					this.listeners.add(listener);
-					return () => {
-						this.listeners.delete(listener);
-					};
-				}
-			};
+      view = {
+        getSnapshot: () => this.cached,
+        subscribe: listener => {
+          this.listeners.add(listener);
+          return () => this.listeners.delete(listener);
+        },
+      };
 
-			/* ------------------------------------------------------ derived state */
+      snapshotOf() { return this.scope.getSnapshot(); }
+      providerSection(id) { return this.snapshotOf().value?.providers?.[id] ?? {}; }
+      fieldPath(field) {
+        const match = /^(\w+)(ApiKeyEnv|ApiKey|BaseUrl)$/.exec(field);
+        if (!match || !this.catalog.ids.includes(match[1])) return [field];
+        return ["providers", match[1], { ApiKeyEnv: "apiKeyEnv", ApiKey: "apiKey", BaseUrl: "baseURL" }[match[2]]];
+      }
+      sectionValue(field) {
+        return this.fieldPath(field).reduce((node, key) => node?.[key], this.snapshotOf().value);
+      }
+      overridden(field) {
+        const path = this.fieldPath(field);
+        const parent = path.slice(0, -1).reduce((node, key) => node?.[key], this.snapshotOf().user);
+        if (parent !== undefined && parent !== null && Object.hasOwn(parent, path.at(-1))) return true;
+        return path[2] === "baseURL" && parent !== undefined && parent !== null && Object.hasOwn(parent, "baseUrl");
+      }
+      keyConfigured(id) { return this.credentials[id]?.configured === true; }
+      keyStored(id) { return this.stored[id] === true; }
+      presetKey() { return false; }
+      hasBaseUrlField(id) { return (this.catalog.endpoints ?? []).includes(id); }
+      keyless(id) { return !this.catalog.keyed.includes(id) && !this.hasBaseUrlField(id); }
+      envOf(id) { return this.providerSection(id).apiKeyEnv ?? this.catalog.envs?.[id] ?? ""; }
+      baseUrlRef(id) { return this.providerSection(id).baseUrlEnv ?? this.catalog.baseUrlEnvs?.[id] ?? ""; }
+      endpointUrl(id) { const p = this.providerSection(id); return String(p.baseURL ?? p.baseUrl ?? "").trim(); }
+      usable(id) {
+        if (this.keyless(id)) return true;
+        if (this.hasBaseUrlField(id)) return this.endpointUrl(id) !== "" || this.credentials[id]?.configured === true;
+        return this.keyConfigured(id) || this.keyStored(id);
+      }
+      explicitOrder() {
+        return this.sectionValue("provider") != null || this.sectionValue("order") != null;
+      }
+      chain() {
+        const order = this.sectionValue("order"), provider = this.sectionValue("provider");
+        if (Array.isArray(order)) return order.filter(id => this.catalog.ids.includes(id));
+        if (provider != null) return this.catalog.ids.includes(provider) ? [provider] : [];
+        return this.catalog.ids.filter(id => this.usable(id));
+      }
 
-			snapshotOf() {
-				return this.scope.getSnapshot();
-			}
-			sectionValue(field) {
-				return this.snapshotOf().value?.[field];
-			}
-			overridden(field) {
-				const user = this.snapshotOf().user;
-				return user !== void 0 && Object.hasOwn(user, field);
-			}
+      /** Atomic path edits preserve masked credentials and fence stale views. */
+      async write(ops) {
+        if (this.disposed || this.busy || !this.snapshotOf().writable || this.snapshotOf().status !== "ready") return false;
+        this.busy = true;
+        this.status = undefined;
+        this.publish();
+        let accepted = false;
+        try {
+          accepted = await this.scope.mutate(Array.isArray(ops) ? ops : [ops], this.snapshotOf().revision);
+        } catch (_transportFailure) {
+          // Only a generic, localized failure reaches the card; never a wire payload.
+        }
+        if (this.disposed) return false;
+        this.busy = false;
+        this.status = { kind: accepted ? "ok" : "error" };
+        this.publish();
+        return accepted;
+      }
+      commitChain(ids) {
+        const unique = [...new Set(ids)];
+        if (unique.some(id => !this.catalog.ids.includes(id))) return Promise.resolve(false);
+        return this.write([
+          { op: "set", path: ["provider"], value: unique.length === 1 ? unique[0] : null },
+          { op: "set", path: ["order"], value: unique.length > 1 ? unique : null },
+        ]);
+      }
+      reorder(dragId, targetId) {
+        const current = this.chain();
+        if (!current.includes(dragId) || (targetId !== undefined && !current.includes(targetId))) return Promise.resolve(false);
+        const ids = current.filter(id => id !== dragId);
+        const at = targetId === undefined ? ids.length : ids.indexOf(targetId);
+        ids.splice(at < 0 ? ids.length : at, 0, dragId);
+        return this.commitChain(ids);
+      }
+      addProvider(id) { return this.commitChain([...this.chain(), id]); }
+      removeProvider(id) { return this.commitChain(this.chain().filter(candidate => candidate !== id)); }
+      resetOrder() { return this.commitChain([]); }
+      moveEarlier(id) { return this.move(id, -1); }
+      moveLater(id) { return this.move(id, 1); }
+      move(id, delta) {
+        const ids = this.chain(), at = ids.indexOf(id);
+        if (at < 0 || at + delta < 0 || at + delta >= ids.length) return Promise.resolve(false);
+        [ids[at], ids[at + delta]] = [ids[at + delta], ids[at]];
+        return this.commitChain(ids);
+      }
+      writeTimeout(value) {
+        return Number.isInteger(value) && value >= 100
+          ? this.write({ op: "set", path: ["timeoutMs"], value }) : Promise.resolve(false);
+      }
+      writeEmptyFallback(value) { return this.write({ op: "set", path: ["emptyResultsFallback"], value }); }
+      writeEndpoint(id, text) {
+        const value = String(text ?? "").trim();
+        if (value === "") return this.resetField(id + "BaseUrl");
+        return this.write([
+          { op: "set", path: ["providers", id, "baseURL"], value },
+          { op: "set", path: ["providers", id, "baseUrl"], value: null },
+        ]);
+      }
+      resetField(field) {
+        const path = this.fieldPath(field);
+        const ops = [{ op: "unset", path }];
+        if (path[2] === "baseURL") ops.push({ op: "unset", path: ["providers", path[1], "baseUrl"] });
+        return this.write(ops);
+      }
+      saveKey(id, value) { return this.write({ op: "set", path: ["providers", id, "apiKey"], value }); }
+      clearKey(id) { return this.write({ op: "unset", path: ["providers", id, "apiKey"] }); }
 
-			/** True when the keyed provider's credential resolves from env/store. */
-			keyConfigured(id) {
-				return this.credentials[id]?.configured === true;
-			}
-
-			/** True when the settings document carries a stored key override. */
-			keyStored(id) {
-				return this.stored[id] === true;
-			}
-
-			/** True when the composition carries a literal key (base-layer flag). */
-			presetKey(id) {
-				return this.snapshotOf().base?.[`${id}KeyPreset`] === true;
-			}
-
-			/** True when a base-URL provider's endpoint resolves from the section. */
-			baseUrlConfigured(id) {
-				return String(this.sectionValue(`${id}BaseUrl`) ?? "").trim() !== "";
-			}
-
-			/** True when the served schema carries `<id>BaseUrl`. */
-			hasBaseUrlField(id) {
-				const value = this.snapshotOf().value;
-				return value !== void 0 && `${id}BaseUrl` in value;
-			}
-
-			/** True when the provider has neither a key nor an endpoint to configure. */
-			keyless(id) {
-				return !this.catalog.keyed.includes(id) && !this.hasBaseUrlField(id);
-			}
-
-			/** The credential reference a keyed provider currently resolves. */
-			envOf(id) {
-				const field = `${id}ApiKeyEnv`;
-				return String(this.snapshotOf().base?.[field] ?? this.snapshotOf().value?.[field] ?? "");
-			}
-
-			/** True when the Host's auto-detection would include this provider. */
-			usable(id) {
-				if (this.catalog.ids.length === 0) return false;
-				if (this.keyless(id)) return true;
-				if (this.hasBaseUrlField(id)) return this.baseUrlConfigured(id);
-				return this.keyConfigured(id) || this.keyStored(id) || this.presetKey(id);
-			}
-
-			/** The currently effective endpoint of a base-URL provider. */
-			endpointUrl(id) {
-				return String(this.sectionValue(`${id}BaseUrl`) ?? "").trim();
-			}
-
-			/** Store (or clear, when blank) one provider's endpoint. */
-			writeEndpoint(id, text) {
-				const trimmed = String(text ?? "").trim();
-				return this.write(trimmed === "" ? { op: "unset", path: [`${id}BaseUrl`] } : { op: "set", path: [`${id}BaseUrl`], value: trimmed });
-			}
-
-			/** True when the user layer carries an explicit order. */
-			explicitOrder() {
-				return this.overridden("order");
-			}
-
-			/** The chain in priority order: explicit order, else auto-detectable ids. */
-			chain() {
-				if (this.explicitOrder()) return parseOrder(this.sectionValue("order"), this.catalog.ids);
-				return (this.catalog?.ids ?? []).filter((id) => this.usable(id));
-			}
-
-			/* ----------------------------------------------------------- writes */
-
-			/** One queued, revision-fenced settings write (top-level field). */
-			async write(op) {
-				this.busy = true;
-				this.publish();
-				try {
-					if (op.op === "set") await this.scope.set(op.path[0], op.value);
-					else await this.scope.unset(op.path[0]);
-					this.status = void 0;
-				} catch (error) {
-					this.status = { kind: "error", text: String(error?.message ?? error) };
-				}
-				this.busy = false;
-				this.publish();
-				return this.status === void 0;
-			}
-
-			/** Commit a chain as the explicit order; an empty chain returns to auto. */
-			async commitChain(ids) {
-				const ok = await this.write(ids.length === 0 ? { op: "unset", path: ["order"] } : { op: "set", path: ["order"], value: ids.join(", ") });
-				if (ok === false) return false;
-				this.status = { kind: "ok" };
-				this.publish();
-				return true;
-			}
-
-			/** Move `dragId` directly before `targetId` (append when target absent). */
-			reorder(dragId, targetId) {
-				const ids = this.chain().filter((id) => id !== dragId);
-				const at = targetId === void 0 ? ids.length : ids.indexOf(targetId);
-				if (at === -1) ids.push(dragId);
-				else ids.splice(at, 0, dragId);
-				return this.commitChain(ids);
-			}
-
-			/** Append one provider to the chain. */
-			addProvider(id) {
-				return this.commitChain([...this.chain(), id]);
-			}
-
-			/** Remove one provider; removing the last returns to automatic. */
-			removeProvider(id) {
-				return this.commitChain(this.chain().filter((candidate) => candidate !== id));
-			}
-
-			/** Drop the explicit order and follow auto-detection again. */
-			resetOrder() {
-				return this.write({ op: "unset", path: ["order"] });
-			}
-
-			/** Store the per-provider timeout. */
-			writeTimeout(value) {
-				if (!Number.isInteger(value) || value < 100) return Promise.resolve(false);
-				return this.write({ op: "set", path: ["timeoutMs"], value });
-			}
-
-			/** Store the empty-results policy. */
-			writeEmptyFallback(value) {
-				return this.write({ op: "set", path: ["emptyResultsFallback"], value });
-			}
-
-			/** Move one provider one position earlier (keyboard path). */
-			moveEarlier(id) {
-				const ids = this.chain();
-				const at = ids.indexOf(id);
-				if (at <= 0) return Promise.resolve(false);
-				const next = [...ids];
-				next.splice(at, 1);
-				next.splice(at - 1, 0, id);
-				return this.commitChain(next);
-			}
-
-			/** Move one provider one position later (keyboard path). */
-			moveLater(id) {
-				const ids = this.chain();
-				const at = ids.indexOf(id);
-				if (at === -1 || at === ids.length - 1) return Promise.resolve(false);
-				const next = [...ids];
-				next.splice(at, 1);
-				next.splice(at + 1, 0, id);
-				return this.commitChain(next);
-			}
-
-			/** Restore any field to its composition-layer value. */
-			resetField(field) {
-				return this.write({ op: "unset", path: [field] });
-			}
-
-			/** Store one API key in the settings document — it overrides env. */
-			saveKey(id, value) {
-				return this.write({ op: "set", path: [`${id}ApiKey`], value });
-			}
-
-			/** Drop the stored key override; resolution falls back to env. */
-			clearKey(id) {
-				return this.write({ op: "unset", path: [`${id}ApiKey`] });
-			}
-
-			/* ---------------------------------------------------- credential state */
-
-			/** Read credential availability (env/store) and the wire's own view. */
-			async readState() {
-				this.readCredentialAvailability();
-				this.readSection();
-			}
-
-			/**
-			 * One `settings.describe` read: the namespace's serialized schema
-			 * envelope yields the provider catalog, its secret sidecar the
-			 * stored-key flags — one wire call for both.
-			 */
-			async readSection() {
-				let response;
-				try {
-					response = await this.api.settings.describe({ redactSecrets: true });
-				} catch (_settingsReadFailure) {
-					return;
-				}
-				if (!response.result.ok) return;
-				const view = response.result.value.namespaces.find((candidate) => candidate.ns === NS);
-				if (view === void 0) return;
-				let changed = false;
-				const catalog = catalogFromEnvelope(view.schema);
-				if (catalog.ids.length > 0 && (catalog.ids.join(",") !== this.catalog.ids.join(",") || JSON.stringify(catalog.labels ?? {}) !== JSON.stringify(this.catalog.labels ?? {}))) {
-					this.catalog = catalog;
-					changed = true;
-					// The catalog just arrived (first wire read): credential
-					// availability was skipped while it was empty — read it
-					// now rather than waiting for the next scope event.
-					this.readCredentialAvailability();
-				}
-				const set = new Set((view.secrets ?? []).filter((secret) => secret.set === true).map((secret) => secret.path?.[0]));
-				for (const id of catalog.keyed) {
-					const next = set.has(`${id}ApiKey`);
-					if (next !== this.stored[id]) {
-						this.stored[id] = next;
-						changed = true;
-					}
-				}
-				if (changed) this.publish();
-			}
-
-			/** Ask the credentials domain about each key's reference. */
-			async readCredentialAvailability() {
-				if (this.catalog.keyed.length === 0) return;
-				const keyed = this.catalog.keyed;
-				const refs = keyed.map((id) => this.envOf(id));
-				let response;
-				try {
-					response = await this.api.credentials.describe({ refs });
-				} catch (_credentialReadFailure) {
-					return;
-				}
-				if (!response.result.ok) return;
-				const views = response.result.value.credentials;
-				let changed = false;
-				for (const id of keyed) {
-					const ref = this.envOf(id);
-					const view = views[ref];
-					const next = { ref, configured: view?.configured ?? false, writable: view?.writable ?? true };
-					const prev = this.credentials[id];
-					if (prev !== undefined && prev.ref === next.ref && prev.configured === next.configured && prev.writable === next.writable) continue;
-					this.credentials[id] = next;
-					changed = true;
-				}
-				if (changed) this.publish();
-			}
-
-			/** Re-read after the Host reports a change to a watched reference. */
-			refreshCredential(ref) {
-				if (!this.catalog.keyed.some((id) => this.envOf(id) === ref)) return;
-				this.readCredentialAvailability();
-			}
-
-			/* -------------------------------------------------------- projection */
-
-			/** @returns the projection the component renders. */
-			projection() {
-				const snap = this.snapshotOf();
-				const chain = this.chain();
-				return {
-					available: snap.status === "ready",
-					writable: snap.writable,
-					busy: this.busy,
-					status: this.status,
-					explicit: this.explicitOrder(),
-					chain,
-					labels: Object.fromEntries(this.catalog.ids.map((id) => [id, this.catalog.labels?.[id] ?? id])),
-					addable: this.catalog.ids.filter((id) => !chain.includes(id)),
-					keys: Object.fromEntries(this.catalog.keyed.map((id) => [id, { ...this.credentials[id], stored: this.stored[id], preset: this.presetKey(id) }])),
-					endpoints: Object.fromEntries(this.catalog.ids.filter((id) => this.hasBaseUrlField(id)).map((id) => [id, {
-						url: String(this.sectionValue(`${id}BaseUrl`) ?? ""),
-						overridden: this.overridden(`${id}BaseUrl`),
-					}])),
-					timeoutMs: {
-						value: this.sectionValue("timeoutMs"),
-						overridden: this.overridden("timeoutMs"),
-					},
-					emptyFallback: {
-						value: this.sectionValue("emptyResultsFallback") !== false,
-						overridden: this.overridden("emptyResultsFallback"),
-					},
-					orderOverridden: this.overridden("order"),
-				};
-			}
-
-			/** Mint the next snapshot, then notify — the only snapshot mutation. */
-			publish() {
-				this.cached = this.projection();
-				for (const listener of this.listeners) listener();
-			}
-
-			/** The face the slot registration injects: the store hook + actions. */
-			inject() {
-				return {
-					hooks: { searchRouterCard: this.view },
-					actions: {
-						reorder: (dragId, targetId) => this.reorder(dragId, targetId),
-						addProvider: (id) => this.addProvider(id),
-						removeProvider: (id) => this.removeProvider(id),
-						resetOrder: () => this.resetOrder(),
-						writeTimeout: (value) => this.writeTimeout(value),
-						writeEmptyFallback: (value) => this.writeEmptyFallback(value),
-						writeEndpoint: (id, text) => this.writeEndpoint(id, text),
-						resetField: (field) => this.resetField(field),
-						saveKey: (id, value) => this.saveKey(id, value),
-						clearKey: (id) => this.clearKey(id),
-						moveEarlier: (id) => this.moveEarlier(id),
-						moveLater: (id) => this.moveLater(id),
-						endpointUrl: (id) => this.endpointUrl(id)
-					}
-				};
-			}
-		}
+      readState() {
+        if (this.disposed) return;
+        const view = this.mirror.getSnapshot().view?.namespaces.find(candidate => candidate.ns === NS);
+        this.catalog = view ? catalogFromEnvelope(view.schema) : EMPTY_CATALOG;
+        this.stored = Object.fromEntries(this.catalog.keyed.map(id => [
+          id, (view?.secrets ?? []).some(secret => secret.set && secret.path?.join(".") === "providers." + id + ".apiKey"),
+        ]));
+        this.publish();
+        void this.readCredentialAvailability();
+      }
+      async readCredentialAvailability() {
+        const generation = ++this.generation;
+        const ids = [...this.catalog.keyed, ...(this.catalog.endpoints ?? [])];
+        const refsById = Object.fromEntries(ids.map(id => [id, this.hasBaseUrlField(id) ? this.baseUrlRef(id) : this.envOf(id)]));
+        const refs = [...new Set(Object.values(refsById).filter(Boolean))];
+        if (refs.length === 0) return;
+        let response;
+        try { response = await this.remote.credentials.describe(refs); }
+        catch (_readFailure) { return; }
+        if (this.disposed || generation !== this.generation || !response.ok) return;
+        this.credentials = Object.fromEntries(ids.map(id => [id, {
+          ref: refsById[id], configured: response.value[refsById[id]]?.configured ?? false,
+        }]));
+        this.publish();
+      }
+      refreshCredential(ref) {
+        if (this.catalog.ids.some(id => this.envOf(id) === ref || this.baseUrlRef(id) === ref)) void this.readCredentialAvailability();
+      }
+      dispose() {
+        this.disposed = true;
+        ++this.generation;
+        for (const dispose of this.disposers) dispose();
+        this.listeners.clear();
+      }
+      projection() {
+        const snap = this.snapshotOf();
+        return {
+          available: snap.status === "ready", writable: snap.writable, busy: this.busy, status: this.status,
+          explicit: this.explicitOrder(), chain: this.chain(),
+          labels: this.catalog.labels ?? {},
+          addable: this.catalog.ids.filter(id => !this.chain().includes(id)),
+          keys: Object.fromEntries(this.catalog.keyed.map(id => [id, { ...this.credentials[id], stored: this.keyStored(id), preset: false }])),
+          endpoints: Object.fromEntries((this.catalog.endpoints ?? []).map(id => [id, {
+            url: this.endpointUrl(id), configured: this.usable(id), overridden: this.overridden(id + "BaseUrl"),
+          }])),
+          timeoutMs: { value: this.sectionValue("timeoutMs"), overridden: this.overridden("timeoutMs") },
+          emptyFallback: { value: this.sectionValue("emptyResultsFallback") !== false, overridden: this.overridden("emptyResultsFallback") },
+          orderOverridden: this.overridden("order") || this.overridden("provider"),
+        };
+      }
+      publish() {
+        if (this.disposed) return;
+        this.cached = this.projection();
+        for (const listener of this.listeners) listener();
+      }
+      inject() {
+        const names = ["reorder", "addProvider", "removeProvider", "resetOrder", "writeTimeout", "writeEmptyFallback",
+          "writeEndpoint", "resetField", "saveKey", "clearKey", "moveEarlier", "moveLater", "endpointUrl"];
+        return { hooks: { searchRouterCard: this.view }, actions: Object.fromEntries(names.map(name => [name, (...args) => this[name](...args)])) };
+      }
+    }
 
 		//#endregion
 		//#region icons
@@ -571,7 +381,7 @@ window.__ModuleLoader__.load({
 		function SearchRouterCard(props) {
 			const { t } = props;
 			const state = props.useSearchRouterCard((snapshot) => snapshot);
-			const [open, setOpen] = useState(false);
+			const [open, setOpen] = useState(true);
 			const [editing, setEditing] = useState(void 0);
 			const [adding, setAdding] = useState(false);
 			const [dragId, setDragId] = useState(void 0);
@@ -585,7 +395,7 @@ window.__ModuleLoader__.load({
 				setDragId(void 0);
 				setOverId(void 0);
 			};
-			return h("li", { className: "dsr-card", "data-open": open ? "true" : void 0 },
+			return h("section", { className: "dsr-card", "data-open": open ? "true" : void 0 },
 				h("button", {
 					type: "button", className: "dsr-head", "aria-expanded": open,
 					"aria-label": `${t(open ? "collapse" : "expand")}: ${t("title")}`,
@@ -709,7 +519,7 @@ window.__ModuleLoader__.load({
 		function props0(state, id) {
 			if (state.keys[id]?.configured === true || state.keys[id]?.stored === true || state.keys[id]?.preset === true) return { kind: "key", ok: true };
 			const endpoint = state.endpoints?.[id];
-			if (endpoint !== undefined) return { kind: "endpoint", ok: endpoint.url !== "" };
+			if (endpoint !== undefined) return { kind: "endpoint", ok: endpoint.configured === true };
 			if (state.keys[id] !== undefined) return { kind: "key", ok: false };
 			return { kind: "keyless", ok: true };
 		}
@@ -927,7 +737,7 @@ window.__ModuleLoader__.load({
 			presetKey: "Using the key set in the profile config",
 			envKey: "Using {ref} from the environment",
 			noKey: "No key set",
-			clearKey: "Clear stored key",
+			clearKey: "Reset key override",
 			configured: "Configured",
 			notConfigured: "Not configured",
 			selfHostedSub: "Self-hosted — no API key",
@@ -971,7 +781,7 @@ window.__ModuleLoader__.load({
 			presetKey: "使用配置文件中设置的密钥",
 			envKey: "使用环境变量 {ref}",
 			noKey: "未设置密钥",
-			clearKey: "清除已存密钥",
+			clearKey: "重置密钥覆盖",
 			configured: "已配置",
 			notConfigured: "未配置",
 			selfHostedSub: "自托管，无需 API Key",
@@ -991,38 +801,21 @@ window.__ModuleLoader__.load({
 		//#region plugin
 
 		/** Required services (cordis fiber inject). */
-		const inject = [
-			"slots",
-			"locale",
-			"connection",
-			"remote",
-			"settingsScope"
-		];
+		const inject = ["slots", "locale", "remote", "remote.credentials", "configForms"];
 
-		/**
-		 * Mount the card: register this card's dictionary, bind the settings
-		 * scope, and claim the `search-router` cell of the Plugins page's card
-		 * slot. The host half serves the namespace; this half renders it.
-		 * @param ctx - the browser plugin context.
-		 */
-		function apply(ctx) {
-			const { api } = ctx.get("connection");
-			ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), "search-router: card dictionary");
-			const controller = new SearchRouterCardController(ctx.settingsScope.bind({ namespace: NS }), api);
-			// Credential invalidations: dsh forwards `credentials/reference-updated`
-			// (single ref-string payload) whenever a watched reference's stored
-			// value changes, so the card's credential dots refresh without a
-			// page round-trip.
-			ctx.effect(() => ctx.remote.$on("credentials/reference-updated", (ref) => {
-				controller.refreshCredential(ref);
-			}), "search-router: credential invalidations");
-			ctx.slots.inject(ITEM_SLOT, () => ctx.slots.register({
-				name: ITEM_SLOT,
-				key: NS,
-				locale: LOCALE_NS,
-				inject: () => controller.inject()
-			}, SearchRouterCard));
-		}
+    /** Mount the third-party bundle page only while its Host Config exists. */
+    function apply(ctx) {
+      ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), "search-router: dictionary");
+      const controller = new SearchRouterCardController(ctx.configForms.get(NS), ctx.configForms.describe(), ctx.remote);
+      ctx.effect(() => () => controller.dispose(), "search-router: subscriptions");
+      ctx.effect(() => ctx.remote.$on("credentials/reference-updated", ref => controller.refreshCredential(ref)), "search-router: credentials");
+      ctx.effect(() => ctx.configForms.whileServed([NS], () => ctx.slots.inject(ITEM_SLOT, () => ctx.slots.register({
+        name: ITEM_SLOT,
+        key: "dsh-search-router",
+        locale: LOCALE_NS,
+        inject: () => controller.inject(),
+      }, SearchRouterCard))), "search-router: bundle page");
+    }
 
 		//#endregion
 		exports.apply = apply;

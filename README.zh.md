@@ -2,128 +2,115 @@
 
 [English](README.md) · **中文**
 
-一个轻量的 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness)
-插件：向 `ctx.web` 注册一个原生 `WebSearchProvider`，把每次 `web_search`
-调用转发到你选择的搜索后端——失败时按顺序自动切换。模型看到的仍是同一个
-`web_search` 工具；没有新工具、没有 MCP、没有重排序、没有缓存。
+基于 [XGrin/dsh-search-router](https://github.com/XGrin/dsh-search-router) 的 `d500bd7` 修复，仅适配 **DSH 0.1.7-rc.2**。插件向现有 `web_search` 注册一个搜索路由，可指定单个后端或顺序 fallback，不增加模型工具。
 
-```
-DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Brave / SearXNG
-```
+## 搜索后端
 
-## 支持的提供方
-
-| 提供方 | 凭据 | 端点 |
+| 后端 | 默认凭据引用 | 默认端点 |
 | --- | --- | --- |
-| **Exa** | `EXA_API_KEY` | `https://api.exa.ai` |
-| **Tavily** | `TAVILY_API_KEY` | `https://api.tavily.com` |
-| **Brave** | `BRAVE_SEARCH_API_KEY` | `https://api.search.brave.com` |
-| **Perplexity** | `PPLX_API_KEY` | `https://api.perplexity.ai` |
-| **DeepSeek** | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1` |
-| **SearXNG** | 无（自托管） | `SEARXNG_BASE_URL` |
-| **DuckDuckGo** | 无 | — |
+| Exa | EXA_API_KEY | https://api.exa.ai |
+| Tavily | TAVILY_API_KEY | https://api.tavily.com |
+| Brave | BRAVE_SEARCH_API_KEY | https://api.search.brave.com |
+| Perplexity | PPLX_API_KEY | https://api.perplexity.ai |
+| DeepSeek | DEEPSEEK_API_KEY | https://api.deepseek.com/anthropic/v1 |
+| SearXNG | 无；从 SEARXNG_BASE_URL 读取端点 | 自托管，需开启 JSON 格式 |
+| DuckDuckGo | 无 | 公开 HTML 搜索 |
 
-SearXNG 让本路由器可以完全自托管——不依赖任何商业 API。实例需开启
-`json` 输出格式（其 `settings.yml` 中的 `search.formats`）。DuckDuckGo 无需
-密钥，因此零配置的部署也能直接提供网页搜索。各提供方端点（及
-Perplexity/DeepSeek 的模型）均可按提供方覆盖（见下方完整 schema）。
+DeepSeek 后端自行调用 Messages API，默认模型 `deepseek-v4-flash`，每次请求最多允许 5 次服务端搜索；它不调用 DSH 的 `deepseek-official` 提供方。商业 API 可能计费。Perplexity 默认模型为 `sonar`。
 
-## 安装
+## 本地安装
 
-```bash
-dsh plugin --profile web add github:XGrin/dsh-search-router
-dsh web
+使用修复后的本地目录，不要直接安装尚未修复的上游版本：
+
+```sh
+dsh plugin --profile web add link:/absolute/path/to/dsh-search-router
 ```
 
-或克隆到本地后以链接方式安装（开发时）：
+该命令会安装依赖、修改 profile，应先审查磁盘影响。本次 Windows 部署复用 E 盘既有 DSH 依赖并手动建立联接，具体路径见本地交付记录；无需为了刷新联接而在日常 profile 中运行依赖安装器。
 
-```bash
-git clone https://github.com/XGrin/dsh-search-router.git
-dsh plugin --profile web add link:/path/to/dsh-search-router
-```
-
-组合补丁会把 web seam 指向本路由器、停用内置的 DeepSeek 搜索，并在 web
-profile 中重新启用 `web_search` 工具。卸载（`dsh plugin --profile web remove
-dsh-search-router`）即恢复原始组合。
-
-## 配置
-
-两种方式，控制同一组开关——GUI 逐字段优先，GUI 里重置则回落到组合层的值。
-零配置时，路由器自动探测所有能拿到密钥或端点的提供方，按固定顺序尝试：
-exa → tavily → brave → perplexity → deepseek → searxng → duckduckgo。
-
-### 在应用里
-
-**设置 → 插件 → 插件配置** 中的“搜索路由”卡片：每个生效提供方一行，按
-故障切换优先级编号，**可拖拽排序**（也支持键盘排序）；每行有内联编辑器，
-另有添加提供方入口和高级折叠区（超时、空结果策略）。所有改动即时生效，
-无需重启。
-
-在此输入的 API Key 以密文持久保存在设置文档中，并**覆盖**环境变量；清除
-已存密钥即回落到 `EXA_API_KEY` / `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY`。
-
-### 在组合层
-
-profile 自己的补丁层——`$DSH_HOME/profiles/web/cordis.patch.yml`（不存在则
-创建）。补丁会整体替换该行的 `config`，需写完整块。两个示例：
-
-```yaml
-# Tavily，失败时切换到自托管 SearXNG
-- id: search-router
-  config:
-    order: [tavily, searxng]
-    providers:
-      tavily: { apiKeyEnv: TAVILY_API_KEY }
-      searxng: { baseUrl: https://search.example.com }
-
-# 仅 SearXNG——完全不使用商业密钥
-- id: search-router
-  config:
-    provider: searxng
-    providers:
-      searxng: { baseUrl: http://127.0.0.1:8888 }
-```
-
-完整 schema：
+插件 bundle 会选择 `web.searchProvider: search-router`、停用 `web-search-deepseek`，并开启 `tool-web`（fetch 关闭）。profile 自身补丁最后生效。添加覆盖时保留现有 web/tool-web 字段。**首次使用前明确选择后端**，避免自动探测选中付费服务：
 
 ```yaml
 - id: search-router
   config:
-    provider: exa                  # 单提供方模式（与 order 互斥）
-    order: [exa, tavily, searxng]  # 故障切换链模式
-    timeoutMs: 10000               # 单提供方超时（默认 10000）
-    emptyResultsFallback: true     # 零结果视为失败（默认 true）
+    provider: deepseek
+    timeoutMs: 10000
+- id: web
+  config:
+    searchProvider: search-router
+    fetchProvider: http
+- id: tool-web
+  disabled: false
+  config:
+    fetch: false
+    searchTimeoutMs: 60000
+```
+
+## GUI 与 YAML 使用同一配置
+
+进入 **插件 → dsh-search-router → 搜索路由**。支持增删后端、拖动排序（也可在拖动柄上使用方向键）、编辑密钥和端点、调整超时及空结果策略。一行表示单后端，多行表示按顺序 fallback。Exa 可留作手动选择项。
+
+后端导出 volatile `Config`，下一次搜索读取最新配置，无需重启插件。前端使用 `configForms.get('search-router')`、共享配置镜像、`remote.credentials` 和第三方 `plugins.bundle.config` 插槽，已移除旧 `settings.register`、`settingsScope.bind`、`connection.api`。
+
+GUI 以带版本检查的路径操作写入当前 profile 的 `cordis.patch.yml`；手动 YAML 编辑也是同一层。保存被拒绝、冲突或连接失败会显示失败；不会把未保存内容当成成功。断线及只读状态禁止写入，重连后同步共享状态；卸载会释放订阅并忽略迟到响应。
+
+`provider` 与 `order` 互斥。GUI 在一次原子修改中更新两者，使用 `null` 清除继承的选择。下面两行是互为替代的示例，只使用其中一个：
+
+```yaml
+# 单后端
+- id: search-router
+  config:
+    provider: deepseek
+    order: null
+
+# 或者：明确的 fallback
+- id: search-router
+  config:
+    provider: null
+    order: [deepseek, exa]
+    timeoutMs: 15000
+    emptyResultsFallback: true
     providers:
-      exa:        { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: … }
-      tavily:     { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: … }
-      brave:      { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: … }
-      perplexity: { apiKey: …, apiKeyEnv: PPLX_API_KEY, baseURL: …, model: sonar }
-      deepseek:   { apiKey: …, apiKeyEnv: DEEPSEEK_API_KEY, baseURL: …, model: deepseek-v4-flash }
-      searxng:    { baseUrl: …, baseUrlEnv: SEARXNG_BASE_URL }
-      duckduckgo: { baseURL: … }
+      deepseek:
+        apiKeyEnv: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+      exa:
+        apiKeyEnv: EXA_API_KEY
+      searxng:
+        baseURL: https://search.example.com
 ```
 
-会提交的文件里请优先用 `apiKeyEnv`，而非明文 `apiKey`。
+两者均未设置（包括均为 null）进入自动模式，按 Exa、Tavily、Brave、Perplexity、DeepSeek、SearXNG、DuckDuckGo 的顺序选择可用后端。GUI 的自动选择操作进入这个模式，不代表恢复为 DeepSeek。
 
-## 故障切换
+各后端配置接受 `apiKey`、`apiKeyEnv`、`baseURL`（别名 `baseUrl`）、`baseUrlEnv`；仅 DeepSeek/Perplexity 支持 `model`。端点环境引用用于无密钥后端，有密钥后端使用显式或默认端点。`timeoutMs` 必须为 >=100 的整数，默认 10000。未知字段或冲突的路由配置会被拒绝。
 
-网络错误、超时、任何非 2xx 状态码、无法解析的响应都算失败，默认情况下零
-结果也算（可设 `emptyResultsFallback: false` 关闭）。路由器按顺序尝试整条
-链，返回首个成功结果；模型不会看到之前提供方的失败。只有全部失败时
-`web_search` 才抛出一个汇总的、不含密钥的错误：
+## 凭据和重置
 
+已有密钥通过 DSH 凭据服务读取，不迁移、不改写原凭据文件。优先使用凭据引用。
+
+在卡片输入的密钥是 **profile 配置中的明文覆盖值**，界面和配置传输会隐藏密钥；隐藏不等于加密。它优先于凭据引用。普通字段修改只提交对应路径，不回写脱敏后的整个对象，因此不会覆盖隐藏密钥。重置删除 profile 覆盖并继承 bundle 配置；没有继承密钥时再读取凭据引用。请勿提交含密钥的 profile 文件。
+
+旧独立 settings 文档不会自动迁移。如需保留旧设置，审查后手动转换到当前嵌套 YAML 格式。
+
+## fallback 和取消
+
+网络错误、非 2xx 状态、无效 JSON 和超时会继续下一个后端。超时覆盖响应头及完整响应体；调用者取消立即停止整条链。默认空结果也触发 fallback；如果所有成功响应均为空，返回空列表。`emptyResultsFallback: false` 时接受第一个成功的空结果。
+
+## 开发验证
+
+测试使用本地模拟端点并禁止外部请求。integration 使用真实 DSH WebRuntime、Settings 和 ConfigEditor，创建的文件保留在 `.local/test-runs`，清理单独进行。
+
+已安装匹配的 DSH 包时：
+
+```sh
+node test/integration.mjs
+node test/client-smoke.mjs
 ```
-search-router: all configured search providers failed:
-- exa: HTTP 429
-- tavily: timeout after 10000ms
-- searxng: HTTP 503
-```
 
-## 开发
+复用 Windows 上既有 DSH 源码时，设置 `DSH_ROOT` 为安装绝对路径、`TSX_TSCONFIG_PATH` 为其 tsconfig.json，使用 `node --import file:///E:/path/to/dsh/node_modules/tsx/dist/esm/index.mjs test/integration.mjs`。将 `DSH_HOME`、`TEMP`、`TMP` 指向本项目 `.local`，设置 `TSX_DISABLE_CACHE=1`、`NODE_DISABLE_COMPILE_CACHE=1` 禁用编译缓存。
 
-```bash
-node test/integration.mjs /path/to/a/dsh/installation/node_modules   # 路由器对真实 seam，模拟提供方
-node test/client-smoke.mjs                                          # 浏览器 bundle，按 shell 的方式加载
-```
+旧 lockfile 及含个人机器路径的实时 probe 已删除，避免装回旧 DSH 包或误触发配置修改/付费搜索。自动测试不会调用真实 API；单独授权的真实宿主、GUI 和 API 验证见本地交付记录。GUI 隔离还必须显式配置默认工作区路径，仅设置 DSH_HOME 或进程工作目录不够。
+
+删除 bundle 不会自动清除 profile 覆盖。回滚应恢复 profile 备份（含依赖清单和 lockfile），或明确选择 `deepseek-official`、启用 `web-search-deepseek` 并清理 router 覆盖；联接删除另行审查。
 
 MIT。

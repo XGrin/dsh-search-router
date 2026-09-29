@@ -103,18 +103,23 @@ export async function httpJSON(url, init, options) {
  */
 export async function httpText(url, init, { signal, timeoutMs }) {
   const link = linkedSignal(signal, timeoutMs);
-  let response;
   try {
-    response = await fetch(url, { ...init, signal: link.inner });
+    let response;
+    try {
+      response = await fetch(url, { ...init, signal: link.inner });
+    } catch (error) {
+      throw new Error(`network error: ${brief(error)}`);
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}${await errorDetail(response)}`);
+    // Keep both abort sources alive until the entire response body is consumed.
+    return await response.text();
   } catch (error) {
     if (signal?.aborted === true) throw callerAborted(signal);
     if (link.inner.aborted) throw new Error(`timeout after ${timeoutMs}ms`, { cause: error });
-    throw new Error(`network error: ${brief(error)}`);
+    throw error;
   } finally {
     link.cleanup();
   }
-  if (!response.ok) throw new Error(`HTTP ${response.status}${await errorDetail(response)}`);
-  return response.text();
 }
 
 /**

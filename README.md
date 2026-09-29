@@ -2,137 +2,115 @@
 
 **English** · [中文](README.zh.md)
 
-A tiny [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness)
-plugin: one native `WebSearchProvider` registered into `ctx.web`, forwarding
-every `web_search` call to a search backend you choose — with sequential
-fallback when one fails. The model keeps seeing the same `web_search` tool; no
-new tools, no MCP, no reranking, no caching.
+Compatibility repair of [XGrin/dsh-search-router](https://github.com/XGrin/dsh-search-router), based on `d500bd7`, for **DSH 0.1.7-rc.2**. Older DSH APIs are unsupported. One native `WebSearchProvider` routes the existing `web_search` tool to a chosen backend or a sequential fallback chain.
 
-```
-DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Brave / SearXNG
-```
+## Backends
 
-## Supported providers
-
-| Provider | Credential | Endpoint |
+| Backend | Default credential reference | Default endpoint |
 | --- | --- | --- |
-| **Exa** | `EXA_API_KEY` | `https://api.exa.ai` |
-| **Tavily** | `TAVILY_API_KEY` | `https://api.tavily.com` |
-| **Brave** | `BRAVE_SEARCH_API_KEY` | `https://api.search.brave.com` |
-| **Perplexity** | `PPLX_API_KEY` | `https://api.perplexity.ai` |
-| **DeepSeek** | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1` |
-| **SearXNG** | none (self-hosted) | `SEARXNG_BASE_URL` |
-| **DuckDuckGo** | none | — |
+| Exa | EXA_API_KEY | https://api.exa.ai |
+| Tavily | TAVILY_API_KEY | https://api.tavily.com |
+| Brave | BRAVE_SEARCH_API_KEY | https://api.search.brave.com |
+| Perplexity | PPLX_API_KEY | https://api.perplexity.ai |
+| DeepSeek | DEEPSEEK_API_KEY | https://api.deepseek.com/anthropic/v1 |
+| SearXNG | none; endpoint from SEARXNG_BASE_URL | Self-hosted; JSON format required |
+| DuckDuckGo | none | Public HTML search |
 
-SearXNG keeps the router fully self-hostable — no commercial API needed. The
-instance must enable the `json` output format (`search.formats` in its
-`settings.yml`). DuckDuckGo is keyless, so a zero-configuration deployment
-still serves web searches out of the box. Provider endpoints (and the
-Perplexity/DeepSeek model) can be overridden per provider (see the full
-schema below).
+The DeepSeek adapter makes its own Messages API request (default model `deepseek-v4-flash`, up to 5 server-side search uses). It does not delegate to DSH's `deepseek-official` provider. Commercial requests may incur charges. Perplexity's default model is `sonar`.
 
-## Install
+## Local installation
 
-```bash
-dsh plugin --profile web add github:XGrin/dsh-search-router
-dsh web
+Use this repaired checkout, not the unmodified upstream GitHub install command:
+
+```sh
+dsh plugin --profile web add link:/absolute/path/to/dsh-search-router
 ```
 
-Or clone and link locally (for development):
+That command installs dependencies and changes the profile. Review its disk effects before running it. For this Windows deployment, dependencies are reused from the existing E-drive DSH installation and the profile is linked manually; see the local delivery report. Do not run a package installer in the daily profile just to refresh this link.
 
-```bash
-git clone https://github.com/XGrin/dsh-search-router.git
-dsh plugin --profile web add link:/path/to/dsh-search-router
-```
-
-The composition patch points the web seam at the router, disables the built-in
-DeepSeek search provider, and re-enables the `web_search` tool in the web
-profile. Uninstall (`dsh plugin --profile web remove dsh-search-router`)
-restores the original composition.
-
-## Configure
-
-Two ways, targeting the same knobs — the GUI wins per field, and a GUI reset
-re-inherits the composition value. With zero configuration the router
-auto-detects every provider whose key or endpoint is ambient, in canonical
-order: exa → tavily → brave → perplexity → deepseek → searxng → duckduckgo.
-
-### In the app
-
-**Settings → Plugins → Plugin configuration** shows a "Search router" card:
-one row per active provider, numbered by fallback priority and **draggable to
-reorder** (also keyboard-reorderable), an inline editor per provider, an
-add-provider flow, and an Advanced fold (timeout, empty-results policy). Every
-change applies live — no restart.
-
-API keys entered here persist in the settings document as secrets and
-**override** the environment variables; clearing a stored key falls back to
-`EXA_API_KEY` / `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY`.
-
-### In the composition
-
-The profile's own patch layer — `$DSH_HOME/profiles/web/cordis.patch.yml`
-(create it if absent). A patch replaces the row's whole `config`, so state the
-complete block. Two examples:
-
-```yaml
-# Tavily, falling back to a self-hosted SearXNG
-- id: search-router
-  config:
-    order: [tavily, searxng]
-    providers:
-      tavily: { apiKeyEnv: TAVILY_API_KEY }
-      searxng: { baseUrl: https://search.example.com }
-
-# SearXNG only — no commercial keys anywhere
-- id: search-router
-  config:
-    provider: searxng
-    providers:
-      searxng: { baseUrl: http://127.0.0.1:8888 }
-```
-
-Full schema:
+The bundle selects `web.searchProvider: search-router`, disables `web-search-deepseek`, and enables `tool-web` with fetch disabled. Profile patches apply last. Preserve your existing web and tool-web settings when adding overrides. **Select an explicit backend before first use** to avoid auto-detecting a paid service unintentionally:
 
 ```yaml
 - id: search-router
   config:
-    provider: exa                  # single-provider mode (XOR with order)
-    order: [exa, tavily, searxng]  # fallback-chain mode
-    timeoutMs: 10000               # per-provider timeout (default 10000)
-    emptyResultsFallback: true     # 0-result success counts as failure (default true)
+    provider: deepseek
+    timeoutMs: 10000
+- id: web
+  config:
+    searchProvider: search-router
+    fetchProvider: http
+- id: tool-web
+  disabled: false
+  config:
+    fetch: false
+    searchTimeoutMs: 60000
+```
+
+## GUI and YAML share one configuration
+
+Open **Plugins → dsh-search-router → Search router**. Add/remove providers, drag rows or use the grip's arrow keys to reorder, edit keys/endpoints, and adjust timeout/empty-result behavior. One row selects a single backend; multiple rows form a fallback chain. Exa can remain unused until explicitly selected here.
+
+The public `Config` schema is volatile: changes affect the next search without remounting the plugin. The card uses `configForms.get('search-router')`, the shared configuration mirror, `remote.credentials`, and the third-party `plugins.bundle.config` slot. It no longer uses `settings.register`, `settingsScope.bind`, or `connection.api`.
+
+GUI edits are path-level operations with a revision check. They write the profile's `cordis.patch.yml`, the same layer you can edit as YAML. Save rejection, conflicts and transport failure are shown as failure; the card does not assume a rejected write succeeded. Disconnected/read-only forms cannot write. Reconnection refreshes the shared state; unloading releases subscriptions and ignores late replies.
+
+`provider` and `order` are mutually exclusive. GUI transitions change both atomically; `null` clears an inherited choice. Do not copy both active alternatives into one config:
+
+```yaml
+# Single backend
+- id: search-router
+  config:
+    provider: deepseek
+    order: null
+
+# Alternative: explicit fallback
+- id: search-router
+  config:
+    provider: null
+    order: [deepseek, exa]
+    timeoutMs: 15000
+    emptyResultsFallback: true
     providers:
-      exa:        { apiKey: …, apiKeyEnv: EXA_API_KEY, baseURL: … }
-      tavily:     { apiKey: …, apiKeyEnv: TAVILY_API_KEY, baseURL: … }
-      brave:      { apiKey: …, apiKeyEnv: BRAVE_SEARCH_API_KEY, baseURL: … }
-      perplexity: { apiKey: …, apiKeyEnv: PPLX_API_KEY, baseURL: …, model: sonar }
-      deepseek:   { apiKey: …, apiKeyEnv: DEEPSEEK_API_KEY, baseURL: …, model: deepseek-v4-flash }
-      searxng:    { baseUrl: …, baseUrlEnv: SEARXNG_BASE_URL }
-      duckduckgo: { baseURL: … }
-  ```
-
-Prefer `apiKeyEnv` over a literal `apiKey` in files you might commit.
-
-## Fallback
-
-A provider counts as failed on network errors, timeouts, any non-2xx status,
-unparseable responses — and by default on empty results
-(`emptyResultsFallback: false` to change). The router walks the chain in order
-and returns the first success; the model never sees the earlier failures. If
-every provider fails, `web_search` throws one aggregated, key-free error:
-
-```
-search-router: all configured search providers failed:
-- exa: HTTP 429
-- tavily: timeout after 10000ms
-- searxng: HTTP 503
+      deepseek:
+        apiKeyEnv: DEEPSEEK_API_KEY
+        model: deepseek-v4-flash
+      exa:
+        apiKeyEnv: EXA_API_KEY
+      searxng:
+        baseURL: https://search.example.com
 ```
 
-## Development
+Use only one of these example rows. If neither selection is set (including both null), auto mode tries available backends in this order: Exa, Tavily, Brave, Perplexity, DeepSeek, SearXNG, DuckDuckGo. The card's automatic action explicitly enters that mode; it is not a switch back to DeepSeek.
 
-```bash
-node test/integration.mjs /path/to/a/dsh/installation/node_modules   # router vs. the real seam, mocked providers
-node test/client-smoke.mjs                                          # browser bundle, the way the shell loads it
+All providers accept `apiKey`, `apiKeyEnv`, `baseURL` (alias `baseUrl`) and `baseUrlEnv`; model overrides apply only to DeepSeek/Perplexity. Endpoint environment references apply to keyless backends; keyed backends use their explicit/default endpoint. `timeoutMs` is an integer >= 100 (default 10000). Unknown fields and conflicting routing choices are rejected.
+
+## Credentials and reset behavior
+
+Existing credentials are resolved through DSH's credentials service. There is no migration or rewriting of the existing credential store. Prefer credential references over literal keys.
+
+A key entered in the router card is a **plaintext profile configuration override**, hidden in the GUI/wire schema; redaction is not encryption. It takes precedence over a credential reference. Ordinary field edits never replace the redacted config object and therefore preserve hidden keys. Reset removes the profile override and inherits the bundle configuration; if no inherited key remains, the credential reference is used. Never commit profile files containing secrets.
+
+The former independent settings document is not migrated. Move any needed old settings manually into this nested profile format after reviewing it.
+
+## Fallback and cancellation
+
+The router tries the chain in order on network errors, non-2xx responses, invalid JSON, or timeout. Timeout covers headers and response body. Caller cancellation stops the chain. Empty results trigger fallback by default; if all successful responses are empty, the router returns an empty list. With `emptyResultsFallback: false`, the first successful empty response wins.
+
+## Development and verification
+
+Tests use local mock endpoints and block external requests. The integration test uses real DSH WebRuntime, Settings and ConfigEditor services. It creates and retains fixture files under `.local/test-runs`; cleanup is separate.
+
+With matching DSH packages installed:
+
+```sh
+node test/integration.mjs
+node test/client-smoke.mjs
 ```
+
+To reuse an existing DSH source checkout on Windows, set `DSH_ROOT` to its absolute path, set `TSX_TSCONFIG_PATH` to its tsconfig.json, and run integration with `node --import file:///E:/path/to/dsh/node_modules/tsx/dist/esm/index.mjs test/integration.mjs`. Redirect `DSH_HOME`, `TEMP`, `TMP` into this project's `.local`; disable tsx/Node compile caches with `TSX_DISABLE_CACHE=1` and `NODE_DISABLE_COMPILE_CACHE=1`.
+
+The obsolete lockfiles and machine-specific live probe were removed: they targeted old DSH packages and could mutate settings or call paid services. No real API requests run in the test suite. The local delivery report records separately authorized real-host/GUI and paid API checks. For GUI isolation, configure DSH's default workspace explicitly as well as DSH_HOME; changing the working directory alone is insufficient.
+
+Removing the bundle does not remove your profile overrides. To restore native search, restore the profile backup (including dependency/lockfile state) or explicitly select `deepseek-official`, enable `web-search-deepseek`, and remove stale router overrides. Review link removal separately.
 
 MIT.

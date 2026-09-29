@@ -97,7 +97,10 @@ export function parseConfig(raw) {
   if (typeof config !== "object" || Array.isArray(config)) {
     throw new Error("search-router: config must be an object");
   }
-  const { provider, order, timeoutMs, emptyResultsFallback, providers, ...unknown } = config;
+  const { provider: rawProvider, order: rawOrder, timeoutMs, emptyResultsFallback, providers, ...unknown } = config;
+  // Null explicitly clears an inherited routing choice in an atomic GUI edit.
+  const provider = rawProvider ?? undefined;
+  const order = rawOrder ?? undefined;
   for (const key of Object.keys(unknown)) {
     throw new Error(`search-router: unknown config key "${key}" (expected provider, order, timeoutMs, emptyResultsFallback, providers)`);
   }
