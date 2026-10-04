@@ -1,6 +1,6 @@
 {
   "name": "dsh-search-router",
-  "version": "0.3.1-dsh017.0",
+  "version": "0.3.2",
   "description": "Route DSH's native web_search tool to user-configurable search providers with sequential fallback. The plugin is a router, not a search engine.",
   "type": "module",
   "main": "src/index.js",
@@ -55,18 +55,19 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
-    "@deepseek-ai/dsh-web": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-settings": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-app-boot": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-config-editor": "0.1.7-rc.2"
+    "@deepseek-ai/dsh-web": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-app-boot": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-config-editor": "0.2.0-rc.2"
   },
   "scripts": {
     "providers": "node scripts/gen-providers.mjs",
-    "test": "node test/integration.mjs && node test/client-smoke.mjs"
+    "test": "node test/compatibility.mjs && node test/integration.mjs && node test/client-smoke.mjs",
+    "test:compatibility": "node test/compatibility.mjs"
   },
   "prepare": "node scripts/gen-providers.mjs",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
-    "@deepseek-ai/dsh-web": "0.1.7-rc.2"
+    "@deepseek-ai/dsh-web": "^0.1.7-rc.2 || ^0.2.0-rc.1"
   }
 }

@@ -1,5 +1,5 @@
 /**
- * Serializable, live plugin configuration for DSH 0.1.7-rc.2.
+ * Serializable, live plugin configuration for DSH's volatile Config API.
  * GUI edits and YAML now address the same nested Config. Secret roles let
  * DSH redact values while preserving path-level writes and presence flags.
  */

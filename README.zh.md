@@ -2,7 +2,13 @@
 
 [English](README.md) · **中文**
 
-基于 [XGrin/dsh-search-router](https://github.com/XGrin/dsh-search-router) 的 `d500bd7` 修复，仅适配 **DSH 0.1.7-rc.2**。插件向现有 `web_search` 注册一个搜索路由，可指定单个后端或顺序 fallback，不增加模型工具。
+基于 [XGrin/dsh-search-router](https://github.com/XGrin/dsh-search-router) 的 `d500bd7` 修复，当前适配 **DSH 0.2.0-rc.2**，此前已验证 **0.1.7-rc.2**；不支持更早的旧接口。插件向现有 `web_search` 注册一个搜索路由，可指定单个后端或顺序 fallback，不增加模型工具。
+
+## 兼容范围
+
+DSH web 的 peer 范围为 `^0.1.7-rc.2 || ^0.2.0-rc.1`。DSH 的兼容检查将预发布版纳入判断：允许 0.1.7-rc.2 ，以及从 0.2.0-rc.1 起的 0.2.x，包括后续补丁版本的 alpha、beta 和 RC。
+
+只要插件依赖的接口保持兼容，就不需要仅因 DSH 发布范围内的新版本而更新插件。搜索、volatile Config、配置表单、凭据或插件插槽若发生破坏性变化，仍可能需要适配。
 
 ## 搜索后端
 
@@ -103,11 +109,12 @@ GUI 以带版本检查的路径操作写入当前 profile 的 `cordis.patch.yml`
 已安装匹配的 DSH 包时：
 
 ```sh
+node test/compatibility.mjs
 node test/integration.mjs
 node test/client-smoke.mjs
 ```
 
-复用 Windows 上既有 DSH 源码时，设置 `DSH_ROOT` 为安装绝对路径、`TSX_TSCONFIG_PATH` 为其 tsconfig.json，使用 `node --import file:///E:/path/to/dsh/node_modules/tsx/dist/esm/index.mjs test/integration.mjs`。将 `DSH_HOME`、`TEMP`、`TMP` 指向本项目 `.local`，设置 `TSX_DISABLE_CACHE=1`、`NODE_DISABLE_COMPILE_CACHE=1` 禁用编译缓存。
+复用 Windows 上既有 DSH 源码时，设置 `DSH_ROOT` 为安装绝对路径、`TSX_TSCONFIG_PATH` 为其 tsconfig.json，使用 `node --import file:///E:/path/to/dsh/node_modules/tsx/dist/esm/index.mjs test/integration.mjs`。将命令中的 `test/integration.mjs` 换成 `test/compatibility.mjs` 可仅运行只读的版本检查测试。将 `DSH_HOME`、`TEMP`、`TMP` 指向本项目 `.local`，设置 `TSX_DISABLE_CACHE=1`、`NODE_DISABLE_COMPILE_CACHE=1` 禁用编译缓存。
 
 旧 lockfile 及含个人机器路径的实时 probe 已删除，避免装回旧 DSH 包或误触发配置修改/付费搜索。自动测试不会调用真实 API；单独授权的真实宿主、GUI 和 API 验证见本地交付记录。GUI 隔离还必须显式配置默认工作区路径，仅设置 DSH_HOME 或进程工作目录不够。
 

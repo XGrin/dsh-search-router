@@ -2,7 +2,13 @@
 
 **English** · [中文](README.zh.md)
 
-Compatibility repair of [XGrin/dsh-search-router](https://github.com/XGrin/dsh-search-router), based on `d500bd7`, for **DSH 0.1.7-rc.2**. Older DSH APIs are unsupported. One native `WebSearchProvider` routes the existing `web_search` tool to a chosen backend or a sequential fallback chain.
+Compatibility repair of [XGrin/dsh-search-router](https://github.com/XGrin/dsh-search-router), based on `d500bd7`, for **DSH 0.2.0-rc.2**, with prior validation on **0.1.7-rc.2**. Older DSH APIs are unsupported. One native `WebSearchProvider` routes the existing `web_search` tool to a chosen backend or a sequential fallback chain.
+
+## Compatibility
+
+The DSH web peer range is `^0.1.7-rc.2 || ^0.2.0-rc.1`. DSH's compatibility check includes prereleases: it accepts 0.1.7-rc.2 and the 0.2.x line starting at 0.2.0-rc.1, including alpha, beta and RC releases of subsequent patch versions.
+
+As long as the interfaces the plugin depends on remain compatible, a new DSH release within this range does not by itself require a plugin update. Breaking changes to search, volatile Config, configuration forms, credentials or plugin slots may still require adaptation.
 
 ## Backends
 
@@ -103,11 +109,12 @@ Tests use local mock endpoints and block external requests. The integration test
 With matching DSH packages installed:
 
 ```sh
+node test/compatibility.mjs
 node test/integration.mjs
 node test/client-smoke.mjs
 ```
 
-To reuse an existing DSH source checkout on Windows, set `DSH_ROOT` to its absolute path, set `TSX_TSCONFIG_PATH` to its tsconfig.json, and run integration with `node --import file:///E:/path/to/dsh/node_modules/tsx/dist/esm/index.mjs test/integration.mjs`. Redirect `DSH_HOME`, `TEMP`, `TMP` into this project's `.local`; disable tsx/Node compile caches with `TSX_DISABLE_CACHE=1` and `NODE_DISABLE_COMPILE_CACHE=1`.
+To reuse an existing DSH source checkout on Windows, set `DSH_ROOT` to its absolute path, set `TSX_TSCONFIG_PATH` to its tsconfig.json, and run compatibility/integration tests with `node --import file:///E:/path/to/dsh/node_modules/tsx/dist/esm/index.mjs test/integration.mjs`. Replace `test/integration.mjs` with `test/compatibility.mjs` to run only the read-only version-gate test. Redirect `DSH_HOME`, `TEMP`, `TMP` into this project's `.local`; disable tsx/Node compile caches with `TSX_DISABLE_CACHE=1` and `NODE_DISABLE_COMPILE_CACHE=1`.
 
 The obsolete lockfiles and machine-specific live probe were removed: they targeted old DSH packages and could mutate settings or call paid services. No real API requests run in the test suite. The local delivery report records separately authorized real-host/GUI and paid API checks. For GUI isolation, configure DSH's default workspace explicitly as well as DSH_HOME; changing the working directory alone is insufficient.
 
