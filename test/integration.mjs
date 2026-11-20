@@ -18,16 +18,27 @@ import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 /* ------------------------------------------------------------------ setup */
 
-const modulesDir = resolve(process.argv[2] ?? process.env.DSH_MODULES ?? "node_modules");
+/**
+ * Where the DSH packages under test come from, most specific first:
+ *   1. an explicit argv[2] (or DSH_MODULES) directory,
+ *   2. the DSH installation that actually serves this machine, so the suite
+ *      validates the runtime the plugin ships into rather than a stale copy,
+ *   3. this package's own node_modules.
+ * Testing against a pinned old copy is exactly how an API break (0.2.2
+ * removed `settings.register`) went unnoticed; prefer the live runtime.
+ */
+const installedModules = "/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules";
+const defaultModules = existsSync(resolve(installedModules, "@deepseek-ai/dsh-web/lib/index.js")) ? installedModules : "node_modules";
+const modulesDir = resolve(process.argv[2] ?? process.env.DSH_MODULES ?? defaultModules);
 const { Context } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/cordis/lib/index.js")).href);
 const { default: WebRuntime } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-web/lib/index.js")).href);
-const { default: FileSettingsProvider } = await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/dsh-settings-file/lib/index.js")).href);
 const routerPlugin = await import(pathToFileURL(resolve("src/index.js")).href);
+const { parseConfig } = await import(pathToFileURL(resolve("src/router.js")).href);
 const settingsExports = await import(pathToFileURL(resolve("src/settings.js")).href);
 
 /** Mutable mock-endpoint behavior; each case adjusts what it needs. */
@@ -168,17 +179,12 @@ async function boot(config, env = {}, options = {}) {
     }
   };
   const ctx = new Context();
-  if (options.settingsPath !== undefined) ctx.plugin(FileSettingsProvider, { path: options.settingsPath, watch: false });
-  ctx.plugin(WebRuntime, { searchProvider: "search-router" });
+  // Await the web seam: the router's `inject: ["web"]` cannot resolve until
+  // WebRuntime has activated, and awaiting only the router fiber would hang.
+  await ctx.plugin(WebRuntime, { searchProvider: "search-router" });
   const fiber = ctx.plugin(routerPlugin, config);
-  await fiber;
-  if (options.settingsPath !== undefined) {
-    const started = Date.now();
-    while (Date.now() - started < 2000) {
-      if (ctx.settings.describe().some((view) => view.ns === "search-router")) break;
-      await sleep(25);
-    }
-  }
+  for (let waited = 0; waited < 2000 && fiber.state !== 2; waited += 25) await sleep(25);
+  if (fiber.state !== 2) await fiber.await?.();
   return { ctx, restore };
 }
 
@@ -474,171 +480,106 @@ console.log("case 10: bad config fails loudly at load");
   check("model accepted where the descriptor declares defaultModel", accepted);
 }
 
-console.log("case 11: settings section is served for the Plugins page");
+console.log("case 11: the plugin row exposes a Config schema that yields a settings form");
 {
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    const { ctx, restore } = await boot({
-      provider: "exa",
-      timeoutMs: 2000,
-      providers: providersBase(),
-    }, {}, { settingsPath });
-    const views = ctx.settings.describe();
-    const view = views.find((candidate) => candidate.ns === "search-router");
-    check("namespace registered", view !== undefined, views.map((v) => v.ns));
-    check("applies live", view?.applies === "live", view?.applies);
-    const expectedSection = {
-      provider: "exa", order: "", timeoutMs: 2000, emptyResultsFallback: true,
-      exaApiKeyEnv: "EXA_API_KEY", tavilyApiKeyEnv: "TAVILY_API_KEY", braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
-      perplexityApiKeyEnv: "PPLX_API_KEY", deepseekApiKeyEnv: "DEEPSEEK_API_KEY",
-      exaKeyPreset: true, tavilyKeyPreset: true, braveKeyPreset: true,
-      perplexityKeyPreset: true, deepseekKeyPreset: true,
-      searxngBaseUrl: `${base}/searxng`,
-    };
-    eq("base projects the composition", view?.base, expectedSection);
-    eq("resolved section carries schema defaults over base", view?.value, expectedSection);
-    await ctx.dispose?.();
-    restore();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  check("Config exported", routerPlugin.Config !== undefined);
+  // The form only appears when SettingsForms.describe()'s volatileForm() keeps
+  // the schema — it drops non-volatile fields and returns undefined when none
+  // remain. Mirror that gate exactly.
+  const zlib = (await import(pathToFileURL(resolve(modulesDir, "@deepseek-ai/schemastery/lib/index.mjs")).href)).default;
+  const volatileForm = (schema) => {
+    if (schema.meta.volatile) return schema;
+    if (schema.type === "object") {
+      const dict = Object.fromEntries(Object.entries(schema.dict ?? {}).flatMap(([key, child]) => {
+        const field = volatileForm(child);
+        return field === undefined ? [] : [[key, field]];
+      }));
+      return Object.keys(dict).length === 0 ? undefined : zlib.object(dict);
+    }
+    return undefined;
+  };
+  const form = volatileForm(routerPlugin.Config);
+  check("Config produces a settings form (volatile fields)", form !== undefined);
+  eq("form exposes every knob", Object.keys(form?.dict ?? {}).sort(),
+    ["emptyResultsFallback", "order", "provider", "providers", "timeoutMs"]);
+  check("schema serializes for the wire", typeof routerPlugin.Config.toJSON === "function");
 }
 
-console.log("case 12: settings writes re-route live searches (the GUI path)");
+console.log("case 12: parseConfig accepts Config output and string orders");
+{
+  const parsed = parseConfig({ provider: "", order: "exa, searxng", timeoutMs: 2000, providers: providersBase() });
+  eq("empty provider string means auto-detect", parsed.provider, undefined);
+  eq("comma-separated order parses", parsed.order, ["exa", "searxng"]);
+  const fromArray = parseConfig({ order: ["tavily", "exa"] });
+  eq("array order survives", fromArray.order, ["tavily", "exa"]);
+  let error;
+  try { parseConfig({ order: ["google"] }); } catch (thrown) { error = thrown; }
+  check("unknown id in order refused", /unknown provider "google"/.test(String(error)), String(error));
+  error = undefined;
+  try { parseConfig({ provider: "exa", order: ["exa"] }); } catch (thrown) { error = thrown; }
+  check("provider XOR order refused", /not both/.test(String(error)), String(error));
+}
+
+console.log("case 13: composition routing and sequential fallback");
 {
   resetBehavior();
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    const { ctx, restore } = await boot({
-      provider: "exa",
-      timeoutMs: 2000,
-      providers: providersBase(),
-    }, {}, { settingsPath });
-    const before = await ctx.web.search({ query: "via composition", maxResults: 5 });
-    eq("composition routing first", before.sources.map((s) => s.url), ["https://example.com/1", "https://example.com/2"]);
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["provider"], value: "searxng" }]);
-    const after = await ctx.web.search({ query: "via settings", maxResults: 5 });
-    eq("settings write re-routes to searxng", after.sources.map((s) => s.url), ["https://example.com/s1"]);
-    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["provider"] }]);
-    const reverted = await ctx.web.search({ query: "back to composition", maxResults: 5 });
-    eq("unset reverts to the composition layer", reverted.sources.map((s) => s.url), ["https://example.com/1", "https://example.com/2"]);
-    await ctx.dispose?.();
-    restore();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  behavior.exa = { status: 429, body: {} };
+  const { ctx, restore } = await boot({ order: ["exa", "searxng"], timeoutMs: 2000, providers: providersBase() });
+  const result = await ctx.web.search({ query: "chain", maxResults: 5 });
+  eq("falls through exa to searxng", result.sources.map((s) => s.url), ["https://example.com/s1"]);
+  await ctx.dispose?.();
+  restore();
+  behavior.exa = structuredClone(defaults.exa);
 }
 
-console.log("case 13: settings validation refuses contradictory writes");
+console.log("case 14: provider exposes the 0.2.2 seam contract");
 {
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
+  let provider;
+  const fakeCtx = {
+    get: () => undefined,
+    logger: { info() {}, warn() {} },
+    web: { registerSearchProvider(candidate) { provider = candidate; return () => {}; } },
+  };
+  routerPlugin.apply(fakeCtx, { provider: "exa", providers: { exa: { apiKey: "k", baseURL: "https://x.test" } } });
+  eq("registers under search-router", provider?.id, "search-router");
+  eq("available() is optimistic", provider?.available(), true);
+  check("ready() present for route-aware readiness", typeof provider?.ready === "function");
+  check("title present for the provider picker", typeof provider?.title === "string" && provider.title.length > 0, provider?.title);
+  check("description is localized", provider?.description?.en !== undefined && provider?.description?.zh !== undefined);
+  eq("ready() true when the chain has a usable backend", await provider.ready("magpie"), true);
+}
+
+console.log("case 15: ready() is false when nothing can authenticate");
+{
+  let provider;
+  const fakeCtx = {
+    get: () => undefined,
+    logger: { info() {}, warn() {} },
+    web: { registerSearchProvider(candidate) { provider = candidate; return () => {}; } },
+  };
+  const savedEnv = process.env.EXA_API_KEY;
+  delete process.env.EXA_API_KEY;
   try {
-    const { ctx, restore } = await boot({ timeoutMs: 2000 }, {}, { settingsPath });
-    let error;
-    try {
-      await ctx.settings.mutate("search-router", [
-        { op: "set", path: ["provider"], value: "exa" },
-        { op: "set", path: ["order"], value: "exa, searxng" },
-      ]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("provider XOR order refused", /not both/.test(String(error)), String(error));
-    error = undefined;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: "google, exa" }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("unknown id in order refused", /unknown provider "google"/.test(String(error)), String(error));
-    error = undefined;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: ", ," }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("order that names nothing refused", /names no providers/.test(String(error)), String(error));
-    error = undefined;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["searxngBaseUrl"], value: "search.example.com" }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("scheme-less searxng URL refused", /http\(s\) URL/.test(String(error)), String(error));
-    const views = ctx.settings.describe();
-    const view = views.find((candidate) => candidate.ns === "search-router");
-    eq("refused writes stored nothing", view?.user, void 0);
-    await ctx.dispose?.();
-    restore();
+    routerPlugin.apply(fakeCtx, { provider: "exa" });
+    eq("missing key -> not ready", await provider.ready("magpie"), false);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    if (savedEnv !== undefined) process.env.EXA_API_KEY = savedEnv;
   }
 }
 
-console.log("case 14: settings fallback order and merge semantics");
+console.log("case 16: a credential from the environment reaches the provider");
 {
   resetBehavior();
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    behavior.exa = { status: 429, body: {} };
-    const { ctx, restore } = await boot({ timeoutMs: 2000, providers: providersBase() }, {}, { settingsPath });
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["order"], value: "exa, searxng" }]);
-    const result = await ctx.web.search({ query: "chain via settings", maxResults: 5 });
-    eq("order string drives the fallback chain", result.sources.map((s) => s.url), ["https://example.com/s1"]);
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["searxngBaseUrl"], value: `${base}/nothing` }]);
-    let error;
-    try {
-      await ctx.web.search({ query: "endpoint moved", maxResults: 5 });
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("searxngBaseUrl override applies", /searxng: HTTP 404/.test(String(error)), String(error));
-    await ctx.dispose?.();
-    restore();
-    behavior.exa = structuredClone(defaults.exa);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  const { ctx, restore } = await boot({
+    timeoutMs: 2000,
+    providers: { exa: { baseURL: `${base}/exa` }, tavily: {}, brave: {}, searxng: {} },
+  }, { EXA_API_KEY: "ambient-env-key" });
+  const first = await ctx.web.search({ query: "ambient key", maxResults: 5 });
+  check("ambient env key reaches the provider", first.sources.length === 2 && seen.exa.at(-1)?.key === "ambient-env-key", seen.exa.at(-1));
+  await ctx.dispose?.();
+  restore();
 }
 
-console.log("case 16: a key stored in settings overrides the ambient environment");
-{
-  resetBehavior();
-  const dir = mkdtempSync(join(tmpdir(), "dsr-settings-"));
-  const settingsPath = join(dir, "settings.yaml");
-  try {
-    const { ctx, restore } = await boot({
-      timeoutMs: 2000,
-      providers: { exa: { baseURL: `${base}/exa` }, tavily: {}, brave: {}, searxng: {} },
-    }, { EXA_API_KEY: "ambient-env-key" }, { settingsPath });
-    const first = await ctx.web.search({ query: "ambient key", maxResults: 5 });
-    check("ambient env key reaches the provider", first.sources.length === 2 && seen.exa.at(-1)?.key === "ambient-env-key", seen.exa.at(-1));
-    await ctx.settings.mutate("search-router", [{ op: "set", path: ["exaApiKey"], value: "settings-stored-key" }]);
-    const second = await ctx.web.search({ query: "stored key", maxResults: 5 });
-    check("settings-stored key overrides the environment", second.sources.length === 2 && seen.exa.at(-1)?.key === "settings-stored-key", seen.exa.at(-1));
-    const redacted = ctx.settings.describe({ redactSecrets: true }).find((view) => view.ns === "search-router");
-    check("redacted view hides the stored key", !JSON.stringify(redacted?.value ?? {}).includes("settings-stored-key"), redacted?.value);
-    check("secret sidecar reports the slot as set", redacted?.secrets?.some((secret) => secret.path?.[0] === "exaApiKey" && secret.set === true), redacted?.secrets);
-    await ctx.settings.mutate("search-router", [{ op: "unset", path: ["exaApiKey"] }]);
-    const third = await ctx.web.search({ query: "back to ambient", maxResults: 5 });
-    check("unsetting falls back to the environment", third.sources.length === 2 && seen.exa.at(-1)?.key === "ambient-env-key", seen.exa.at(-1));
-    let error;
-    try {
-      await ctx.settings.mutate("search-router", [{ op: "set", path: ["exaApiKey"], value: "  " }]);
-    } catch (thrown) {
-      error = thrown;
-    }
-    check("blank key refused", /non-empty/.test(String(error)), String(error));
-    await ctx.dispose?.();
-    restore();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
 
 console.log("case 17: provider markup is stripped from snippets");
 {
@@ -709,32 +650,25 @@ console.log("case 18: perplexity, deepseek, duckduckgo backends");
   }
 }
 
-console.log("case 15: mergeRuntime layering as a pure function");
+console.log("case 15: catalog and order parsing drive the Config schema");
 {
   const { BACKENDS } = await import(pathToFileURL(resolve("src/router.js")).href);
   const catalog = settingsExports.providerCatalog(BACKENDS);
-  const base = settingsExports.projectBase(catalog)({ provider: "exa", order: undefined, timeoutMs: 5000, emptyResultsFallback: true, providers: {} });
-  const merge = (resolved) => settingsExports.mergeRuntime(catalog)({ provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {} }, resolved, base);
-  eq("identical resolution inherits the composition", merge(structuredClone(base)), {
-    provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("changed timeoutMs overrides only that field", merge({ ...structuredClone(base), timeoutMs: 1500 }), {
-    provider: "exa", timeoutMs: 1500, emptyResultsFallback: true, providers: {},
-  });
-  eq("order set clears a composition provider", merge({ ...structuredClone(base), order: "searxng" }), {
-    order: ["searxng"], timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("explicit Automatic clears composition routing", merge({ ...structuredClone(base), provider: "" }), {
-    timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("undefined section is the composition itself", merge(void 0), {
-    provider: "exa", timeoutMs: 5000, emptyResultsFallback: true, providers: {},
-  });
-  eq("stored key becomes the provider's literal apiKey", settingsExports.mergeRuntime(catalog)(
-    { timeoutMs: 5000, providers: {} },
-    { ...structuredClone(base), provider: "", tavilyApiKey: "k" },
-    base,
-  ).providers.tavily, { apiKey: "k" });
+  check("catalog lists every backend", catalog.ids.length === Object.keys(BACKENDS).length, catalog.ids);
+  check("keyed providers detected", catalog.keyed.includes("exa") && catalog.keyed.includes("tavily"), catalog.keyed);
+  check("keyless providers detected", catalog.keyless.includes("duckduckgo") && catalog.keyless.includes("searxng"), catalog.keyless);
+  check("model-capable backend flagged", catalog.hasModel("perplexity"), catalog.hasModel("perplexity"));
+  eq("order string splits on commas and spaces", settingsExports.parseOrderString("exa, searxng", catalog.ids), ["exa", "searxng"]);
+  eq("order array passes through deduped", settingsExports.parseOrderString(["exa", "exa", "tavily"], catalog.ids), ["exa", "tavily"]);
+  let error;
+  try { settingsExports.parseOrderString("google", catalog.ids); } catch (thrown) { error = thrown; }
+  check("unknown id named in the error", /unknown provider "google"/.test(String(error)), String(error));
+  // Declared defaults live in the schema metadata (a volatile schema projects
+  // `{}` through ~standard; the Loader passes the raw composition to apply()).
+  const declared = (key) => routerPlugin.Config.dict[key]?.meta?.default;
+  eq("timeoutMs default declared", declared("timeoutMs"), 10000);
+  eq("emptyResultsFallback default declared", declared("emptyResultsFallback"), true);
+  eq("provider defaults to auto-detect", declared("provider"), "");
 }
 
 /* ------------------------------------------------------------------- done */

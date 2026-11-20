@@ -7,10 +7,14 @@
 # 1. insert the search-router plugin row (registers the `search-router`
 #    WebSearchProvider into ctx.web);
 # 2. point the web seam at it (web.searchProvider = search-router), so the
-#    native web_search tool resolves to the router instead of deepseek-official;
-# 3. disable the built-in web-search-deepseek provider row — with the seam
-#    configured above it would never be called, but disabling also keeps it
-#    from initializing at all (and from asking for DEEPSEEK_API_KEY);
+#    native web_search tool resolves to the router. On DSH 0.2.2 the shipped
+#    default is deepseek-search-api; pinning the id here overrides it whatever
+#    the default becomes;
+# 3. disable ALL built-in DeepSeek search provider rows — legacy Messages
+#    search (web-search-deepseek) and the 0.2.2 default DeepSeek Search API
+#    (web-deepseek-api). With the seam pinned above they would never be
+#    selected, but leaving them enabled keeps them initializing and asking
+#    for credentials this deployment does not need;
 # 4. re-enable the tool-web row, which the shipped web profile disables: a
 #    search router without the model-facing web_search tool would be pointless.
 #    fetch stays off — this plugin routes search only.
@@ -22,8 +26,8 @@
 #
 #   - id: web
 #     config:
-#       searchProvider: deepseek-official
-#   - id: web-search-deepseek
+#       searchProvider: deepseek-search-api
+#   - id: web-deepseek-api
 #     disabled: false
 #
 # Configure the router itself by overriding the plugin row's config in the
@@ -38,12 +42,18 @@
 - insert:
     - id: search-router
       name: dsh-search-router
+      # An explicit config block makes the row's own settings layer visible in
+      # the profile, so edits from the 插件 panel persist here. The defaults
+      # (auto-detect chain, 10s timeout) apply when this stays empty.
+      config: {}
 
 - id: web
   config:
     searchProvider: search-router
 
 - id: web-search-deepseek
+  disabled: true
+- id: web-deepseek-api
   disabled: true
 
 - id: tool-web

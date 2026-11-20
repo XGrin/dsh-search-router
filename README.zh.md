@@ -11,6 +11,12 @@
 DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Brave / SearXNG
 ```
 
+## 环境要求
+
+**DSH 0.2.2 或更高版本。** 插件基于 0.2.2 的插件机制构建：配置是行的 `Config`
+schema、字段标记为 `.volatile()`，图形界面表单通过 `plugins.row.config` 客户端槽位
+提供。0.1.x 上不可用（那时这两者都还不存在）。
+
 ## 支持的提供方
 
 | 提供方 | 凭据 | 端点 |
@@ -48,19 +54,18 @@ dsh-search-router`）即恢复原始组合。
 
 ## 配置
 
-两种方式，控制同一组开关——GUI 逐字段优先，GUI 里重置则回落到组合层的值。
-零配置时，路由器自动探测所有能拿到密钥或端点的提供方，按固定顺序尝试：
-exa → tavily → brave → perplexity → deepseek → searxng → duckduckgo。
+控制同一组开关。零配置时，路由器自动探测所有能拿到密钥或端点的提供方，
+按固定顺序尝试：exa → tavily → brave → perplexity → deepseek → searxng → duckduckgo。
 
 ### 在应用里
 
-**设置 → 插件 → 插件配置** 中的“搜索路由”卡片：每个生效提供方一行，按
-故障切换优先级编号，**可拖拽排序**（也支持键盘排序）；每行有内联编辑器，
-另有添加提供方入口和高级折叠区（超时、空结果策略）。所有改动即时生效，
-无需重启。
+插件自带浏览器端，注册了 `plugins.row.config` 条目，因此在**插件**面板
+（侧边栏面板，不是"设置 → 内置插件"）中，它的行会带有**配置**入口：
+打开该 bundle，展开"包含的组件"，选中 `search-router` 那一行。改动实时生效，无需重启。
 
-在此输入的 API Key 以密文持久保存在设置文档中，并**覆盖**环境变量；清除
-已存密钥即回落到 `EXA_API_KEY` / `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY`。
+每个提供方行都可以直接**填入 API Key**。该字段声明为 `role('secret')`：DSH 会把值
+存进 profile 的密钥库，从所有设置响应中剥离（浏览器只知道"是否已设置"），也不会写进
+组合配置文件。留空则回落到启动环境变量或 `providers.<id>.apiKeyEnv`。
 
 ### 在组合层
 
@@ -103,7 +108,9 @@ profile 自己的补丁层——`$DSH_HOME/profiles/web/cordis.patch.yml`（不�
       duckduckgo: { baseURL: … }
 ```
 
-会提交的文件里请优先用 `apiKeyEnv`，而非明文 `apiKey`。
+在 GUI 表单里填写的 `apiKey` 会由 DSH 作为密文保管（`role('secret')`）：该值不会
+出现在任何设置响应里，也不会以明文写进本文件——回写时是 `{{SECRET_…}}` 占位符，
+由 Host 在读取时解析。若 key 已存在于启动环境中，优先用 `apiKeyEnv` 引用。
 
 ## 故障切换
 

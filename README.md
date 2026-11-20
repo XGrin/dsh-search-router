@@ -12,6 +12,13 @@ new tools, no MCP, no reranking, no caching.
 DSH Agent → web_search → ctx.web → dsh-search-router → Exa / Tavily / Brave / SearXNG
 ```
 
+## Requirements
+
+**DSH 0.2.2 or newer.** The plugin is built against the 0.2.2 plugin surface:
+its configuration is a row `Config` schema whose fields are `.volatile()`, and
+its GUI form is contributed through the `plugins.row.config` client slot. It
+does not work on 0.1.x, where neither existed.
+
 ## Supported providers
 
 | Provider | Credential | Endpoint |
@@ -52,22 +59,22 @@ restores the original composition.
 
 ## Configure
 
-Two ways, targeting the same knobs — the GUI wins per field, and a GUI reset
-re-inherits the composition value. With zero configuration the router
+Configuration targets one set of knobs. With zero configuration the router
 auto-detects every provider whose key or endpoint is ambient, in canonical
 order: exa → tavily → brave → perplexity → deepseek → searxng → duckduckgo.
 
 ### In the app
 
-**Settings → Plugins → Plugin configuration** shows a "Search router" card:
-one row per active provider, numbered by fallback priority and **draggable to
-reorder** (also keyboard-reorderable), an inline editor per provider, an
-add-provider flow, and an Advanced fold (timeout, empty-results policy). Every
-change applies live — no restart.
+The plugin ships a browser half that registers a `plugins.row.config` entry,
+so its row carries a **Configure** control in the **Plugins** panel (the
+sidebar panel, not Settings → Built-in plugins). Open the bundle, expand its
+components, and pick the `search-router` row. Edits apply live — no restart.
 
-API keys entered here persist in the settings document as secrets and
-**override** the environment variables; clearing a stored key falls back to
-`EXA_API_KEY` / `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY`.
+Each provider row also takes an **API key**. The field is declared
+`role('secret')`, so DSH stores the value in the profile's secret store,
+strips it from every settings response (the browser only learns whether one
+is set), and never writes it into the composition file. Leaving it blank
+falls back to the launching environment or `providers.<id>.apiKeyEnv`.
 
 ### In the composition
 
@@ -111,7 +118,11 @@ Full schema:
       duckduckgo: { baseURL: … }
   ```
 
-Prefer `apiKeyEnv` over a literal `apiKey` in files you might commit.
+A literal `apiKey` typed into the GUI form is stored by DSH as a secret
+(`role('secret')`): the value never rides on a settings response and never
+appears in this file in clear text — it is written back as a `{{SECRET_…}}`
+token the Host resolves at read time. Prefer `apiKeyEnv` when a key already
+lives in the launching environment.
 
 ## Fallback
 
